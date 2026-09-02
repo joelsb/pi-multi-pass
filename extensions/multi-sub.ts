@@ -2252,21 +2252,64 @@ function parseHttpStatus(errorMessage: string): number | undefined {
 }
 
 /**
+ * The status an Anthropic-style `error.type` corresponds to, for the messages
+ * that arrive without one.
+ *
+ * Measured across this machine's session history on 2026-09-02: every
+ * `overloaded_error` and `api_error` was recorded with no status prefix, while
+ * `rate_limit_error` always carried its 429 and `invalid_request_error` its 400.
+ * The type is the reliable signal, the prefix is not.
+ *
+ * Anything absent from this map has no inferable status - including a bare
+ * provider string like Codex's `Codex error: The usage limit has been reached`,
+ * which is the case this exists to get right.
+ */
+const ERROR_TYPE_STATUS: Record<string, number> = {
+	overloaded_error: 529,
+	api_error: 500,
+	rate_limit_error: 429,
+	invalid_request_error: 400,
+	authentication_error: 401,
+	permission_error: 403,
+	not_found_error: 404,
+};
+
+function inferStatusFromErrorType(errorMessage: string): number | undefined {
+	const match = errorMessage.match(/"type"\s*:\s*"([a-z_]+_error)"/);
+	return match ? ERROR_TYPE_STATUS[match[1]] : undefined;
+}
+
+/**
  * Will pi re-run this turn by itself?
  *
- * pi 0.84.4 `isRetryableProviderError` (dist/bundle/chunks/chunk-XNGRGP62.js):
- * an `x-should-retry` header wins, otherwise 408, 409, 429 and >= 500 retry and
- * everything else does not.
+ * pi 0.84.4, dist/bundle/chunks/chunk-XNGRGP62.js, has TWO gates and both must
+ * pass before anything is retried:
+ *
+ *   isProviderError(e)  = e instanceof Error && "status" in e && "headers" in e
+ *   isRetryableProviderError(e) = x-should-retry header, else 408/409/429/>=500
+ *   if (!isProviderError(e) || !isRetryableProviderError(e)) throw e;
+ *
+ * The first gate is the one that matters here: an error carrying no status is
+ * not even a candidate, so pi throws it immediately.
  *
  * This decides whether failover has to replay the prompt after switching
- * accounts. Getting it wrong is costly in both directions - a missed replay
- * leaves the turn unexecuted on a healthy account, a spurious one sends the
- * prompt twice - so an unrecognised message returns **true**: assume pi handles
- * it, and keep today's rotate-only behaviour rather than risking a duplicate.
+ * accounts, and the first version of it defaulted an unrecognised message to
+ * `true` - "assume pi handles it" - as the conservative choice against sending
+ * the prompt twice. That was provably wrong, and it cost a real run.
+ *
+ * Codex reports its cap as the bare string `Codex error: The usage limit has
+ * been reached`: no status, no JSON body. Measured 2026-09-02 on a worker
+ * sub-agent: four tool calls on openai-codex/gpt-5.5, the cap, a correct
+ * rotation to anthropic/claude-opus-5 - and then the session file ends. Not one
+ * request on the new account. Nobody replayed, because this function claimed pi
+ * would, and pi had already thrown the error for want of a status.
+ *
+ * So no status means pi will NOT retry, and the caller must. Only a parsed,
+ * pi-retryable status returns true.
  */
 function piWillRetryTurn(errorMessage: string): boolean {
-	const status = parseHttpStatus(errorMessage);
-	if (status === undefined) return true;
+	const status = parseHttpStatus(errorMessage) ?? inferStatusFromErrorType(errorMessage);
+	if (status === undefined) return false;
 	if (status >= 500) return true;
 	return PI_RETRYABLE_STATUSES.has(status);
 }

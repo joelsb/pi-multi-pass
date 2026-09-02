@@ -34,7 +34,7 @@ import { createJiti } from "jiti";
 const here = new URL(".", import.meta.url).pathname;
 const extPath = join(here, "..", "extensions", "multi-sub.ts");
 const agentDir = mkdtempSync(join(tmpdir(), "multipass-replay-"));
-const originalPrompt = "map the bounce classification pipeline and write docs/bounces.md";
+const originalPrompt = "audit the session files and write docs/forensics.md";
 
 writeFileSync(join(agentDir, "multi-pass.json"), JSON.stringify({
 	subscriptions: [{ provider: "anthropic", index: 2 }],
@@ -221,66 +221,40 @@ await emit("before_agent_start", {
 	systemPromptOptions: { cwd: agentDir },
 });
 
-// ── First failure: a 429, which pi retries itself. Rotate, do not replay. ──
+// ── A provider error with NO HTTP status, with a live target available ────
 //
-// This case comes first on purpose. Run it at the end of the cascade instead
-// and it passes for the wrong reason: with every account already attempted,
-// handleError returns false before it ever reaches the replay, so a build that
-// replays unconditionally would still show zero replays here. Caught 2026-09-02
-// by planting exactly that defect and watching this file stay green.
-await emit("agent_end", rateLimitedEvent("anthropic"));
-assert.equal(currentModel.provider, "anthropic-2", "a 429 must still rotate the account");
-assert.equal(
-	injectedUserMessages.length,
-	0,
-	"pi retries a 429 itself; replaying it would send the prompt twice",
-);
-
-await replayTurn();
-
-// ── Second failure: out of credit on a 400, which pi will not retry ──
-await emit("agent_end", creditExhaustedEvent("anthropic-2"));
-assert.equal(currentModel.provider, "openai-codex", "must hop the chain to codex");
+// This is the decisive case. pi's retry gate is
+//   isProviderError(error) && isRetryableProviderError(error)
+// and isProviderError requires BOTH `status` and `headers` on the error object
+// (pi 0.84.4, dist/bundle/chunks/chunk-XNGRGP62.js). An error carrying neither
+// is thrown immediately and never retried. So on such an error a rotation MUST
+// replay the turn - otherwise the work stops dead on a healthy account.
+//
+// It runs FIRST, where anthropic-2 and the whole codex entry are still live. At
+// the end of a cascade handleError returns before the replay and this would pass
+// for the wrong reason - which is how the 429 assertion in
+// failover-replay-check.mjs fooled me on 2026-09-02.
+await emit("agent_end", codexCapEvent("anthropic", "claude-opus-5"));
+assert.equal(currentModel.provider, "anthropic-2", "a capped account must still rotate");
 assert.equal(
 	injectedUserMessages.length,
 	1,
-	"pi does not retry a 400, so the rotation must replay the turn itself",
+	"pi cannot retry a statusless error, so the rotation must replay the turn itself",
 );
-assert.equal(
-	injectedUserMessages[0].content,
-	originalPrompt,
-	"the replay must carry the original prompt, not a summary of it",
-);
-assert.equal(
-	injectedUserMessages[0].options?.deliverAs,
-	"followUp",
-	'"followUp", not "steer": the replay is a new turn on the new provider, not an injection into the turn that just failed',
-);
+assert.equal(injectedUserMessages[0].options?.deliverAs, "followUp");
 
-assert.deepEqual(modelSwitches, ["anthropic-2:claude-opus-5", "openai-codex:gpt-5.6-sol"]);
-
-// ── Third failure: nothing left to rotate to, so nothing to replay ──
-//
-// pi re-emits before_agent_start for the replayed turn; the cascade must
-// survive it, or this failure starts a fresh cascade and retries the account
-// that just died.
 await replayTurn();
-await emit("agent_end", creditExhaustedEvent("openai-codex", "gpt-5.6-sol"));
-assert.equal(
-	currentModel.provider,
-	"openai-codex",
-	"cascade is exhausted, the model must stay put",
-);
+
+// A 429 in the same position - live target still available - must NOT replay,
+// because pi retries that one itself.
+await emit("agent_end", rateLimitedEvent("anthropic-2", "claude-opus-5"));
+assert.equal(currentModel.provider, "openai-codex", "429 rotates too");
 assert.equal(
 	injectedUserMessages.length,
 	1,
-	"a failed rotation must not replay - that would loop the prompt forever on a dead cascade",
+	"a 429 has a status pi acts on; replaying it would send the prompt twice",
 );
-
-// The no-status case needs a live target to be meaningful, so it lives in
-// tests/no-status-replay-check.mjs with its own cascade rather than here at the
-// exhausted end of this one.
 
 console.log(
-	`failover replay checks passed (${modelSwitches.length} rotations, ${injectedUserMessages.length} replays)`,
+	`no-status replay checks passed (${modelSwitches.length} rotations, ${injectedUserMessages.length} replay)`,
 );
