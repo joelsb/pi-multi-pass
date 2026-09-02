@@ -59,7 +59,8 @@ writeFileSync(join(agentDir, "auth.json"), JSON.stringify({
 }, null, 2));
 
 process.env.MULTIPASS_TEST_AGENT_DIR = agentDir;
-process.env.MULTI_PASS_RETRY_IN_PLACE_MS = "40";
+process.env.MULTI_PASS_RETRY_IN_PLACE_MS = "20";
+process.env.MULTI_PASS_RETRY_IN_PLACE_ATTEMPTS = "3";
 delete process.env.MULTI_SUB;
 
 const jiti = createJiti(import.meta.url, {
@@ -233,34 +234,38 @@ await emit("before_agent_start", {
 // So the first refusal retries the SAME account, and only the second rotates.
 const ledgerPath = join(agentDir, "multi-pass-exhausted.json");
 
-await emit("agent_end", creditExhaustedEvent("anthropic", "claude-opus-5"));
-assert.equal(
-	currentModel.provider,
-	"anthropic",
-	"the first refusal must NOT rotate - the account may be perfectly healthy",
-);
-assert.deepEqual(modelSwitches, [], "and it must not call setModel at all");
-assert.equal(injectedUserMessages.length, 1, "it retries by replaying the same prompt");
-assert.equal(injectedUserMessages[0].options?.deliverAs, "followUp");
-assert.ok(
-	!existsSync(ledgerPath),
-	"a blip must never reach the shared ledger - that is what evicts every other process",
-);
-assert.ok(
-	notifications.some((n) => n.message.includes("retrying the same account")),
-	"and the user must be told why the turn paused",
-);
+// Three attempts, then rotate. Each refusal must replay on the SAME account and
+// leave the shared ledger untouched - publishing a blip is what evicts every
+// other pi process from a working account for five minutes.
+for (let attempt = 1; attempt <= 3; attempt++) {
+	await emit("agent_end", creditExhaustedEvent("anthropic", "claude-opus-5"));
+	assert.equal(
+		currentModel.provider,
+		"anthropic",
+		`refusal ${attempt} of 3 must NOT rotate - the account may be perfectly healthy`,
+	);
+	assert.deepEqual(modelSwitches, [], "and must not call setModel at all");
+	assert.equal(injectedUserMessages.length, attempt, "each attempt replays the prompt once");
+	assert.equal(injectedUserMessages[attempt - 1].options?.deliverAs, "followUp");
+	assert.ok(
+		!existsSync(ledgerPath),
+		"a blip must never reach the shared ledger",
+	);
+	assert.ok(
+		notifications.some((n) => n.message.includes(`attempt ${attempt} of 3`)),
+		`the user must be told this is attempt ${attempt} of 3`,
+	);
+	await replayTurn();
+}
 
-await replayTurn();
-
-// ── The second refusal on the same account does rotate ───────────────────
+// ── The fourth refusal is evidence, not noise ────────────────────────────
 await emit("agent_end", creditExhaustedEvent("anthropic", "claude-opus-5"));
 assert.equal(
 	currentModel.provider,
 	"anthropic-2",
-	"twice in one turn is evidence, not noise - now rotate",
+	"once the attempts are spent, rotate",
 );
-assert.equal(injectedUserMessages.length, 2, "and replay onto the new account");
+assert.equal(injectedUserMessages.length, 4, "and replay onto the new account");
 
 await replayTurn();
 
@@ -277,6 +282,19 @@ assert.equal(
 	"a 429 must rotate on the first failure - pi has already retried it",
 );
 assert.equal(currentModel.provider, "openai-codex");
+
+// ── The default is 3 when nothing is configured ──────────────────────────
+{
+	const saved = process.env.MULTI_PASS_RETRY_IN_PLACE_ATTEMPTS;
+	delete process.env.MULTI_PASS_RETRY_IN_PLACE_ATTEMPTS;
+	assert.equal(mod.retryInPlaceAttempts(), 3, "default attempts must be 3");
+	process.env.MULTI_PASS_RETRY_IN_PLACE_ATTEMPTS = "junk";
+	assert.equal(mod.retryInPlaceAttempts(), 3, "junk falls back to 3");
+	process.env.MULTI_PASS_RETRY_IN_PLACE_ATTEMPTS = "0";
+	assert.equal(mod.retryInPlaceAttempts(), 0, "0 disables in-place retry");
+	if (saved === undefined) delete process.env.MULTI_PASS_RETRY_IN_PLACE_ATTEMPTS;
+	else process.env.MULTI_PASS_RETRY_IN_PLACE_ATTEMPTS = saved;
+}
 
 console.log(
 	`retry-in-place checks passed (${modelSwitches.length} rotations, ${injectedUserMessages.length} replays)`,

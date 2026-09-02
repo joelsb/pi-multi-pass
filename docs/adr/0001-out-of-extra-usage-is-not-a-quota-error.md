@@ -40,6 +40,56 @@ haiku behave identically under a given path), credential type (both accounts are
 `type: "oauth"` with valid refresh tokens), and concurrency (three parallel
 requests all returned OK).
 
+## Authoritative explanation, added 2026-09-02 after reading the API docs
+
+The first version of this ADR said the 400 is "not a quota decision". That was
+wrong in an important way. Anthropic's error reference
+(https://platform.claude.com/docs/en/api/errors) says:
+
+> **400 invalid_request_error** - "The API also returns a 400 when usage reaches
+> an organization or workspace spend limit you set, except limits on the Claude
+> Code workspace, which can return a 429 instead."
+
+> **429 rate_limit_error** - "Your organization has hit a rate limit, reached its
+> usage tier's monthly spend cap, or reached a spend limit on the Claude Code
+> workspace. A tier spend-cap 429 has no retry-after header and keeps failing
+> until access resumes."
+
+So both are spend limits, on **different workspaces**, and which one a request is
+charged to depends on whether Anthropic recognises it as Claude Code traffic:
+
+| Observed | Limit that fired | What it means |
+|---|---|---|
+| `400` "out of extra usage. Ask your workspace admin to add more" | some other workspace or the org | the request was NOT attributed to Claude Code, so it billed against a budget that is empty |
+| `429 rate_limit_error` | the Claude Code workspace, or the tier's monthly cap | the actual subscription allowance |
+
+This explains every observation at once, including the two that looked
+contradictory:
+
+- The prompt reword fixes the 400 because it restores Claude Code attribution.
+  The budget was never the variable; the *workspace* was.
+- The message names a workspace admin rather than credits, because it is
+  literally a workspace spend limit.
+- Joel's subscription allowance genuinely was exhausted and renewed at 22:00
+  local on 2026-09-02 - and that exhaustion is the 83 `429 rate_limit_error`
+  entries in this machine's history, never the 400s.
+- Two minutes after that renewal, bare requests still returned 400 on both
+  accounts while prompt-fixed requests returned OK. A renewed allowance does not
+  help a request charged to the wrong workspace.
+
+**Consequence for rotation, unchanged but now for the right reason.** Rotating
+accounts cannot fix a 400: if the request is misattributed on one account it is
+misattributed on all of them, which is exactly what the four-way probe showed.
+Retrying in place cannot fix it either, but it costs one request and protects
+the far more common transient case. Publishing it to the shared ledger is the
+only genuinely harmful response, and that is what this ADR forbids.
+
+**A refinement this surfaces, not yet implemented.** The docs say a tier
+spend-cap 429 carries **no retry-after header and keeps failing until access
+resumes**, whereas an ordinary rate-limit 429 does carry one. Multi-pass treats
+all 429s alike with a 5 minute cooldown. A spend-cap 429 deserves a much longer
+one, and the presence of `retry-after` is how to tell them apart.
+
 ## The three conditions, measured
 
 Every anthropic error in this machine's 479 session files, grouped by status and

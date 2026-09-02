@@ -296,6 +296,28 @@ If the script throws, returns an invalid provider name, or the file is missing, 
 4. During retry replays for the same prompt, it preserves cascade state and avoids re-trying already attempted providers
 5. Session status shows the active chain start entry: `chain:<name> | starts <pool> -> <model>`
 
+## Retry the same account before rotating away from it
+
+A single refusal is not proof an account is finished. Measured on one session, one model, one account, four minutes apart: `ok`, `ok`, **refused**, `ok`. Rotating on that one refusal moved a healthy account aside, published the eviction to every other pi process for five minutes, and pushed everything onto the last provider until it capped for real.
+
+So a refusal now **replays the prompt on the same account** first, and only rotates once the attempts are spent:
+
+```
+[pool:anthropic] anthropic-2 refused this request; retrying the same account in 2s (attempt 1 of 3) before rotating
+```
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MULTI_PASS_RETRY_IN_PLACE_ATTEMPTS` | `3` | tries on the same account before rotating; `0` restores rotate-on-first-error |
+| `MULTI_PASS_RETRY_IN_PLACE_MS` | `2000` | delay before each try; `0` also disables |
+
+Two things worth knowing:
+
+- **A 429 still rotates immediately.** The retry is gated on the same predicate as the failover replay, so it only applies to errors pi did *not* already retry internally. By the time a 429 reaches this extension, pi has exhausted its own attempts.
+- **The cost against a genuinely dead account is bounded and real**: `attempts x delay` before moving on, so `3 x 2s` is 6 seconds and three wasted requests per account. Lower both if you would rather a dead cascade fail fast.
+
+Nothing is written to the shared exhaustion ledger during in-place retries - that is the whole point. A blip must not evict a working account for every other process on the machine.
+
 ## Tiers: keeping your model's class across a chain hop
 
 A chain entry names one model, so before tiers every hop landed on that model no matter what the session was running. A cheap recon session got promoted to a flagship model, and a flagship session could be quietly demoted mid-task. Neither is an error; you find out from the bill or from a suddenly worse answer.

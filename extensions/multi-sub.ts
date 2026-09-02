@@ -3094,7 +3094,7 @@ class PoolManager {
 				prompt: "",
 				attemptedProviders: new Set([currentModel.provider]),
 				visitedChainIndexes: new Set<number>(),
-				retriedInPlace: new Set<string>(),
+				retriedInPlace: new Map<string, number>(),
 			};
 			this.cascadeState = fallbackState;
 			return fallbackState;
@@ -3105,7 +3105,7 @@ class PoolManager {
 				prompt,
 				attemptedProviders: new Set([currentModel.provider]),
 				visitedChainIndexes: new Set<number>(),
-				retriedInPlace: new Set<string>(),
+				retriedInPlace: new Map<string, number>(),
 			};
 		} else {
 			this.cascadeState.attemptedProviders.add(currentModel.provider);
@@ -3124,7 +3124,7 @@ class PoolManager {
 				prompt,
 				attemptedProviders: new Set(currentModel ? [currentModel.provider] : []),
 				visitedChainIndexes: new Set<number>(),
-				retriedInPlace: new Set<string>(),
+				retriedInPlace: new Map<string, number>(),
 			};
 			return;
 		}
@@ -3181,20 +3181,24 @@ class PoolManager {
 		// ledger, because that would evict a healthy account for every other
 		// process on the machine.
 		const inPlaceDelay = retryInPlaceDelayMs();
+		const inPlaceMax = retryInPlaceAttempts();
+		const inPlaceSpent = cascade.retriedInPlace.get(currentModel.provider) ?? 0;
 		if (
 			inPlaceDelay > 0 &&
+			inPlaceMax > 0 &&
 			lastUserPrompt &&
 			!piWillRetryTurn(errorMessage) &&
-			!cascade.retriedInPlace.has(currentModel.provider)
+			inPlaceSpent < inPlaceMax
 		) {
-			cascade.retriedInPlace.add(currentModel.provider);
+			const attempt = inPlaceSpent + 1;
+			cascade.retriedInPlace.set(currentModel.provider, attempt);
 			ctx.ui.notify(
-				`[pool:${pool.name}] ${currentModel.provider} refused this request; retrying the same account in ${Math.round(inPlaceDelay / 1000)}s before rotating`,
+				`[pool:${pool.name}] ${currentModel.provider} refused this request; retrying the same account in ${Math.round(inPlaceDelay / 1000)}s (attempt ${attempt} of ${inPlaceMax}) before rotating`,
 				"info",
 			);
 			ctx.ui.setStatus(
 				"multi-pass",
-				`pool:${pool.name} | retrying ${currentModel.provider} (${currentModel.id})`,
+				`pool:${pool.name} | retrying ${currentModel.provider} (${currentModel.id}) ${attempt}/${inPlaceMax}`,
 			);
 			await new Promise((resolve) => setTimeout(resolve, inPlaceDelay));
 			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
@@ -4961,10 +4965,10 @@ interface FailoverCascadeState {
 	attemptedProviders: Set<string>;
 	visitedChainIndexes: Set<number>;
 	/**
-	 * Accounts already given a second chance on the same account this turn.
-	 * One entry each; the next failure rotates. See retryInPlaceDelayMs.
+	 * In-place retries already spent per account this turn. Once an account
+	 * reaches retryInPlaceAttempts(), the next failure rotates.
 	 */
-	retriedInPlace: Set<string>;
+	retriedInPlace: Map<string, number>;
 }
 
 /**
@@ -4980,11 +4984,31 @@ interface FailoverCascadeState {
  * One retry costs at most one request per account per turn. An eviction costs
  * every process five minutes of avoiding a working account.
  */
-function retryInPlaceDelayMs(): number {
+export function retryInPlaceDelayMs(): number {
 	const raw = process.env.MULTI_PASS_RETRY_IN_PLACE_MS;
 	if (raw === undefined) return 2000;
 	const parsed = Number.parseInt(raw, 10);
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 2000;
+}
+
+/**
+ * How many times to retry the same account before rotating away from it.
+ *
+ * Three by default. One retry already separates a blip from a fact, but the
+ * refusals measured here arrive in runs, and the account that answered two
+ * seconds ago is still the best next guess - it holds the warm prompt cache and
+ * it is the account the user chose.
+ *
+ * The cost is bounded and worth stating: against a genuinely dead account this
+ * spends attempts x delay before moving on, so the default is 3 x 2s = 6s and
+ * three wasted requests per account. Lower it if a cascade needs to be fast;
+ * 0 attempts restores rotate-on-first-error.
+ */
+export function retryInPlaceAttempts(): number {
+	const raw = process.env.MULTI_PASS_RETRY_IN_PLACE_ATTEMPTS;
+	if (raw === undefined) return 3;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3;
 }
 
 function formatFailoverTarget(
