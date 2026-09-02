@@ -40,6 +40,30 @@ haiku behave identically under a given path), credential type (both accounts are
 `type: "oauth"` with valid refresh tokens), and concurrency (three parallel
 requests all returned OK).
 
+## The three conditions, measured
+
+Every anthropic error in this machine's 479 session files, grouped by status and
+type on 2026-09-02. `sub` counts sub-agent sessions, `top` counts top-level ones:
+
+| status | error type | n | sub | top | message |
+|---|---|---|---:|---:|---|
+| 400 | `invalid_request_error` | 146 | 90 | 56 | You're out of extra usage. Ask your workspace admin... |
+| 429 | `rate_limit_error` | 83 | **0** | 83 | This request would exceed your account's rate limit. |
+| - | `overloaded_error` | 15 | 0 | 15 | Overloaded |
+
+They are three different conditions and only the middle one means "you are at
+your limit":
+
+- **429 `rate_limit_error`** - the real thing. Rotate and publish.
+- **`overloaded_error`** - transient capacity at the provider. Rotate, never publish.
+- **400 `invalid_request_error`** - the prompt refusal described above. Rotate, never publish.
+
+The zero is the decisive cell. Not one of the 83 genuine rate limits came from a
+sub-agent, while 90 of the 146 refusals did - on the same accounts, in the same
+days. Sub-agents launch with `--no-extensions` and so lack the prompt fix, which
+is the only difference between the two populations. An account that was really
+empty would have refused the parents too.
+
 ## Consequences
 
 - A prompt refusal no longer marks a funded account dead for every process on the

@@ -57,6 +57,21 @@ const MUST_FAIL_OVER = [
 	"You're out of extra usage",
 	// Anthropic pay-as-you-go with an empty balance.
 	"Your credit balance is too low to access the Anthropic API",
+	// The GENUINE Anthropic limit, verbatim. Distinct status, distinct type and
+	// distinct wording from the 400 above - which is the whole point: 83 of these
+	// appear in this machine's session history and not one of them came from a
+	// sub-agent, while the 400 above appears 90 times in sub-agents alone. Same
+	// accounts. If the accounts were really empty, sub-agents would see this too.
+	'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s rate limit. Please try again later."}}',
+	// The same limit with no status prefix. pi formats errorMessage as
+	// `${status} ${body}` today, so the /429/ pattern alone would carry the case
+	// above and hide the loss of every wording pattern - planting that exact
+	// defect on 2026-09-02 left the suite green. The rotate decision must survive
+	// on the words, because the status prefix is pi's formatting choice and not
+	// something the provider guarantees.
+	"This request would exceed your account's rate limit. Please try again later.",
+	// Transient capacity on the provider side, not an account condition.
+	'{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
 	// The classic cases, which must keep working.
 	"429 rate_limit_error",
 	"You have exceeded your usage limit for this model",
