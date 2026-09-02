@@ -63,6 +63,13 @@ async function scenario({ chains, startModel, pools }) {
 	}, null, 2));
 	process.env.MULTIPASS_TEST_AGENT_DIR = agentDir;
 	delete process.env.MULTI_SUB;
+// Retry-in-place is off for this file on purpose. Its subject is what happens
+// WHEN a rotation occurs, and with the default 2s in-place retry the first
+// refusal on each account no longer rotates at all. The interaction between the
+// two is covered by tests/retry-in-place-check.mjs, which drives a full cascade
+// with the policy on.
+process.env.MULTI_PASS_RETRY_IN_PLACE_MS = "0";
+
 
 	const jiti = createJiti(import.meta.url, {
 		interopDefault: true,

@@ -3094,6 +3094,7 @@ class PoolManager {
 				prompt: "",
 				attemptedProviders: new Set([currentModel.provider]),
 				visitedChainIndexes: new Set<number>(),
+				retriedInPlace: new Set<string>(),
 			};
 			this.cascadeState = fallbackState;
 			return fallbackState;
@@ -3104,6 +3105,7 @@ class PoolManager {
 				prompt,
 				attemptedProviders: new Set([currentModel.provider]),
 				visitedChainIndexes: new Set<number>(),
+				retriedInPlace: new Set<string>(),
 			};
 		} else {
 			this.cascadeState.attemptedProviders.add(currentModel.provider);
@@ -3122,6 +3124,7 @@ class PoolManager {
 				prompt,
 				attemptedProviders: new Set(currentModel ? [currentModel.provider] : []),
 				visitedChainIndexes: new Set<number>(),
+				retriedInPlace: new Set<string>(),
 			};
 			return;
 		}
@@ -3164,6 +3167,39 @@ class PoolManager {
 		if (!pool) return false;
 
 		const cascade = this.ensureCascadeState(lastUserPrompt, currentModel);
+
+		// Give this account one more go before writing it off.
+		//
+		// Gated on the same predicate as the replay: when piWillRetryTurn is true,
+		// pi has ALREADY retried this request internally and surfaced the failure
+		// only after exhausting its own attempts, so a second try here adds
+		// nothing. When it is false - a bare provider string, or a 400 - pi did not
+		// try at all, and on this provider a 400 is frequently a transient refusal
+		// rather than a capacity fact (docs/adr/0001).
+		//
+		// Deliberately before markExhausted: a blip must not reach the shared
+		// ledger, because that would evict a healthy account for every other
+		// process on the machine.
+		const inPlaceDelay = retryInPlaceDelayMs();
+		if (
+			inPlaceDelay > 0 &&
+			lastUserPrompt &&
+			!piWillRetryTurn(errorMessage) &&
+			!cascade.retriedInPlace.has(currentModel.provider)
+		) {
+			cascade.retriedInPlace.add(currentModel.provider);
+			ctx.ui.notify(
+				`[pool:${pool.name}] ${currentModel.provider} refused this request; retrying the same account in ${Math.round(inPlaceDelay / 1000)}s before rotating`,
+				"info",
+			);
+			ctx.ui.setStatus(
+				"multi-pass",
+				`pool:${pool.name} | retrying ${currentModel.provider} (${currentModel.id})`,
+			);
+			await new Promise((resolve) => setTimeout(resolve, inPlaceDelay));
+			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
+			return true;
+		}
 
 		// Mark current as exhausted before planning the cascade.
 		this.markExhausted(currentModel.provider, errorMessage);
@@ -4924,6 +4960,31 @@ interface FailoverCascadeState {
 	prompt: string;
 	attemptedProviders: Set<string>;
 	visitedChainIndexes: Set<number>;
+	/**
+	 * Accounts already given a second chance on the same account this turn.
+	 * One entry each; the next failure rotates. See retryInPlaceDelayMs.
+	 */
+	retriedInPlace: Set<string>;
+}
+
+/**
+ * How long to wait before retrying the SAME account once, rather than evicting
+ * it on a single refusal. 0 disables and restores rotate-on-first-error.
+ *
+ * Why this exists: on 2026-09-02 the same session, model and account produced
+ * ok, ok, refused, ok within four minutes. Rotating on that one refusal moved a
+ * healthy account out of the way, published the eviction to every other pi
+ * process for five minutes, and pushed the whole fleet onto the one remaining
+ * provider until it capped for real. The account was never dead.
+ *
+ * One retry costs at most one request per account per turn. An eviction costs
+ * every process five minutes of avoiding a working account.
+ */
+function retryInPlaceDelayMs(): number {
+	const raw = process.env.MULTI_PASS_RETRY_IN_PLACE_MS;
+	if (raw === undefined) return 2000;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 2000;
 }
 
 function formatFailoverTarget(

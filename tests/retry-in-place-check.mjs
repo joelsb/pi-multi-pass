@@ -26,7 +26,7 @@
  *   node tests/failover-replay-check.mjs
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
@@ -34,7 +34,7 @@ import { createJiti } from "jiti";
 const here = new URL(".", import.meta.url).pathname;
 const extPath = join(here, "..", "extensions", "multi-sub.ts");
 const agentDir = mkdtempSync(join(tmpdir(), "multipass-replay-"));
-const originalPrompt = "audit the session files and write docs/forensics.md";
+const originalPrompt = "implement task 3 of the page-intros plan";
 
 writeFileSync(join(agentDir, "multi-pass.json"), JSON.stringify({
 	subscriptions: [{ provider: "anthropic", index: 2 }],
@@ -59,14 +59,8 @@ writeFileSync(join(agentDir, "auth.json"), JSON.stringify({
 }, null, 2));
 
 process.env.MULTIPASS_TEST_AGENT_DIR = agentDir;
+process.env.MULTI_PASS_RETRY_IN_PLACE_MS = "40";
 delete process.env.MULTI_SUB;
-// Retry-in-place is off for this file on purpose. Its subject is what happens
-// WHEN a rotation occurs, and with the default 2s in-place retry the first
-// refusal on each account no longer rotates at all. The interaction between the
-// two is covered by tests/retry-in-place-check.mjs, which drives a full cascade
-// with the policy on.
-process.env.MULTI_PASS_RETRY_IN_PLACE_MS = "0";
-
 
 const jiti = createJiti(import.meta.url, {
 	interopDefault: true,
@@ -228,40 +222,62 @@ await emit("before_agent_start", {
 	systemPromptOptions: { cwd: agentDir },
 });
 
-// ── A provider error with NO HTTP status, with a live target available ────
+// ── One refusal must not evict a healthy account ─────────────────────────
 //
-// This is the decisive case. pi's retry gate is
-//   isProviderError(error) && isRetryableProviderError(error)
-// and isProviderError requires BOTH `status` and `headers` on the error object
-// (pi 0.84.4, dist/bundle/chunks/chunk-XNGRGP62.js). An error carrying neither
-// is thrown immediately and never retried. So on such an error a rotation MUST
-// replay the turn - otherwise the work stops dead on a healthy account.
+// Measured 2026-09-02, one session, one model, one account, four minutes:
+//   18:04:01 ok / 18:04:25 ok / 18:04:27 refused / 18:08:27 ok
+// Rotating on that single refusal moved a working account aside, published the
+// eviction to every other pi process for five minutes, and pushed the fleet
+// onto the last remaining provider until it capped for real.
 //
-// It runs FIRST, where anthropic-2 and the whole codex entry are still live. At
-// the end of a cascade handleError returns before the replay and this would pass
-// for the wrong reason - which is how the 429 assertion in
-// failover-replay-check.mjs fooled me on 2026-09-02.
-await emit("agent_end", codexCapEvent("anthropic", "claude-opus-5"));
-assert.equal(currentModel.provider, "anthropic-2", "a capped account must still rotate");
+// So the first refusal retries the SAME account, and only the second rotates.
+const ledgerPath = join(agentDir, "multi-pass-exhausted.json");
+
+await emit("agent_end", creditExhaustedEvent("anthropic", "claude-opus-5"));
 assert.equal(
-	injectedUserMessages.length,
-	1,
-	"pi cannot retry a statusless error, so the rotation must replay the turn itself",
+	currentModel.provider,
+	"anthropic",
+	"the first refusal must NOT rotate - the account may be perfectly healthy",
 );
+assert.deepEqual(modelSwitches, [], "and it must not call setModel at all");
+assert.equal(injectedUserMessages.length, 1, "it retries by replaying the same prompt");
 assert.equal(injectedUserMessages[0].options?.deliverAs, "followUp");
+assert.ok(
+	!existsSync(ledgerPath),
+	"a blip must never reach the shared ledger - that is what evicts every other process",
+);
+assert.ok(
+	notifications.some((n) => n.message.includes("retrying the same account")),
+	"and the user must be told why the turn paused",
+);
 
 await replayTurn();
 
-// A 429 in the same position - live target still available - must NOT replay,
-// because pi retries that one itself.
-await emit("agent_end", rateLimitedEvent("anthropic-2", "claude-opus-5"));
-assert.equal(currentModel.provider, "openai-codex", "429 rotates too");
+// ── The second refusal on the same account does rotate ───────────────────
+await emit("agent_end", creditExhaustedEvent("anthropic", "claude-opus-5"));
 assert.equal(
-	injectedUserMessages.length,
-	1,
-	"a 429 has a status pi acts on; replaying it would send the prompt twice",
+	currentModel.provider,
+	"anthropic-2",
+	"twice in one turn is evidence, not noise - now rotate",
 );
+assert.equal(injectedUserMessages.length, 2, "and replay onto the new account");
+
+await replayTurn();
+
+// ── An error pi already retried itself must rotate immediately ───────────
+//
+// A 429 reaches us only after pi exhausted its own retries, so a second try
+// here would add nothing. This is why the in-place retry is gated on the same
+// predicate as the replay rather than on "is it a limit".
+const switchesBefore429 = modelSwitches.length;
+await emit("agent_end", rateLimitedEvent("anthropic-2", "claude-opus-5"));
+assert.equal(
+	modelSwitches.length,
+	switchesBefore429 + 1,
+	"a 429 must rotate on the first failure - pi has already retried it",
+);
+assert.equal(currentModel.provider, "openai-codex");
 
 console.log(
-	`no-status replay checks passed (${modelSwitches.length} rotations, ${injectedUserMessages.length} replay)`,
+	`retry-in-place checks passed (${modelSwitches.length} rotations, ${injectedUserMessages.length} replays)`,
 );
