@@ -2684,7 +2684,28 @@ class PoolManager {
 			return { pool, candidates, skips };
 		}
 
-		for (let chainIndex = applicable.index + 1; chainIndex < applicable.chain.entries.length; chainIndex++) {
+		// Traverse the chain as a ring, starting after the entry we are on.
+		//
+		// This used to stop at the end of the array, which made the last entry a
+		// dead end: with chain "all" = [0] anthropic, [1] codex, a session on codex
+		// got applicable.index = 1, the loop began at 2, and ran zero times. Not
+		// "no eligible member" - no candidate was ever considered, so a funded
+		// anthropic pool was unreachable. Two planners died that way on 2026-09-02
+		// after 14 minutes of work, with credit sitting on the accounts one entry
+		// away, reported as "Failover exhausted after openai-codex".
+		//
+		// A chain is the set of routes across providers, so which entry you happen
+		// to start on must not decide which routes exist.
+		//
+		// Bounded by state that already existed rather than by the array end:
+		// visitedChainIndexes considers each entry at most once per turn, and
+		// attemptedProviders refuses an account already tried. Modulo arithmetic
+		// over entries.length - 1 steps therefore cannot revisit or spin, and the
+		// entry we started from is excluded because its own members were handled by
+		// same-pool rotation above.
+		const entryCount = applicable.chain.entries.length;
+		for (let step = 1; step < entryCount; step++) {
+			const chainIndex = (applicable.index + step) % entryCount;
 			const entry = applicable.chain.entries[chainIndex];
 			if (visitedChainIndexes.has(chainIndex)) {
 				skips.push({
