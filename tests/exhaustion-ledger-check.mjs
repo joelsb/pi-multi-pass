@@ -117,6 +117,19 @@ async function spawnInstance(label) {
 	return {
 		emit,
 		current: () => currentModel,
+		/** An ambiguous refusal that Anthropic words like a billing error. */
+		failAmbiguous: (provider) => emit("agent_end", {
+			type: "agent_end",
+			messages: [{
+				role: "assistant",
+				provider,
+				model: "claude-opus-5",
+				stopReason: "error",
+				errorMessage:
+					'400 {"type":"error","error":{"type":"invalid_request_error","message":"You\'re out of extra usage. Ask your workspace admin to add more so you can keep going."}}',
+				content: [],
+			}],
+		}),
 		fail: (provider) => emit("agent_end", {
 			type: "agent_end",
 			messages: [{
@@ -186,6 +199,29 @@ assert.equal(
 	resilient.current().provider,
 	"anthropic-2",
 	"an unreadable ledger degrades to today's behaviour, it does not throw",
+);
+
+// ── An ambiguous refusal must NOT be published ────────────────────────────
+//
+// Anthropic returns `400 "You're out of extra usage"` when its OAuth endpoint
+// refuses the request for reasons unrelated to billing - the same account and
+// model succeed once pi's system prompt is reworded. Rotating locally on it is
+// fine; telling every other process the account is dead for five minutes is how
+// two planners ended up on codex with funded anthropic accounts idle.
+writeFileSync(ledgerPath, JSON.stringify({}), "utf-8");
+await new Promise((resolve) => setTimeout(resolve, 1100));
+
+const ambiguous = await spawnInstance("ambiguous");
+await ambiguous.failAmbiguous("anthropic");
+assert.equal(
+	ambiguous.current().provider,
+	"anthropic-2",
+	"it must still rotate locally - the next account may not trip whatever refused this one",
+);
+assert.deepEqual(
+	JSON.parse(readFileSync(ledgerPath, "utf-8")),
+	{},
+	"but an ambiguous refusal must not mark the account dead for every other process",
 );
 
 console.log("exhaustion ledger checks passed");

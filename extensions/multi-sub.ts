@@ -2196,6 +2196,38 @@ function isRateLimitError(errorMessage: string): boolean {
 	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
 }
 
+/**
+ * Errors that are unambiguously "this account has no capacity left", and so are
+ * safe to publish to the shared ledger where every other pi process will act on
+ * them for the next five minutes.
+ *
+ * `out of (extra )?usage` is deliberately NOT here. Anthropic's OAuth endpoint
+ * returns `400 "You're out of extra usage. Ask your workspace admin to add
+ * more"` when it refuses the request for reasons that have nothing to do with
+ * billing - the same account, the same model and the same minute returns 200
+ * once pi's system prompt is reworded (see
+ * ~/.pi/agent/extensions/anthropic-oauth-prompt-fix.ts, which bisected it to two
+ * lines). Measured 2026-09-02: `pi -p` succeeds while `pi --no-extensions -p`
+ * fails, back to back.
+ *
+ * Rotating locally on it is still right - the next account might not trip
+ * whatever refused this one. Persisting it is not: one refusal would mark a
+ * healthy funded account dead for every process on the machine, which is
+ * exactly how two planners ended up on codex until codex capped.
+ */
+const LEDGER_WORTHY_PATTERNS = [
+	/usage.?limit/i,
+	/rate.?limit/i,
+	/limit.*reached/i,
+	/too many requests/i,
+	/quota/i,
+	/429/,
+];
+
+function isLedgerWorthyLimit(errorMessage: string): boolean {
+	return LEDGER_WORTHY_PATTERNS.some((p) => p.test(errorMessage));
+}
+
 /** Statuses under 500 that pi 0.84.4 retries. Anything else 4xx it gives up on. */
 const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
 
@@ -2826,15 +2858,19 @@ class PoolManager {
 	}
 
 	/** Mark a member as exhausted (hit rate limit) */
-	markExhausted(providerName: string): void {
+	markExhausted(providerName: string, errorMessage?: string): void {
 		const poolName = this.providerToPool.get(providerName);
 		if (!poolName) return;
 		const state = this.getOrCreatePoolState(poolName);
 		const at = Date.now();
 		state.exhausted.set(providerName, at);
-		// Publish it so every other pi process - and every sub-agent spawned from
-		// now on - skips this account instead of re-discovering it.
-		recordExhaustedInLedger(providerName, at);
+		// Publish only an unambiguous capacity error, so every other pi process and
+		// every sub-agent spawned from now on skips this account instead of
+		// rediscovering it. An ambiguous refusal stays in this process: see
+		// LEDGER_WORTHY_PATTERNS for why a false entry is worse than none.
+		if (errorMessage === undefined || isLedgerWorthyLimit(errorMessage)) {
+			recordExhaustedInLedger(providerName, at);
+		}
 	}
 
 	/** Get the next available member in a pool, skipping the current one */
@@ -3086,8 +3122,8 @@ class PoolManager {
 
 		const cascade = this.ensureCascadeState(lastUserPrompt, currentModel);
 
-		// Mark current as exhausted before planning the forward-only cascade.
-		this.markExhausted(currentModel.provider);
+		// Mark current as exhausted before planning the cascade.
+		this.markExhausted(currentModel.provider, errorMessage);
 
 		const plan = this.buildFailoverPlan(
 			currentModel,
