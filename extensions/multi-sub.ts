@@ -2314,6 +2314,37 @@ function piWillRetryTurn(errorMessage: string): boolean {
 	return PI_RETRYABLE_STATUSES.has(status);
 }
 
+/**
+ * Is spending another request on the SAME account worth it?
+ *
+ * Only for a 400. That is not the same question as "will pi retry this", and
+ * conflating the two is what produced the run in the screenshot on 2026-09-03:
+ * three pointless 2s retries against `Codex error: The usage limit has been
+ * reached` before rotating, because that string carries no status and so
+ * `!piWillRetryTurn` was true.
+ *
+ * The three classes, each measured (ADR 0001 has the counts):
+ *
+ *   - **400 `invalid_request_error`** - Anthropic refusing a request whose
+ *     prompt it did not attribute to Claude Code, reported as a workspace spend
+ *     limit. The same account, model and minute answers 200 once the prompt is
+ *     reworded. A per-request refusal, so retrying in place is the cheapest
+ *     discriminator and frequently works.
+ *   - **429 `rate_limit_error`** - the real allowance, and pi has already
+ *     exhausted its own retries before we see it. Retrying adds nothing.
+ *   - **no status** (Codex's cap) - a capacity fact, not a per-request one.
+ *     Nothing on this account will serve the turn until the cap resets, so the
+ *     only useful move is to rotate now.
+ *
+ * The replay after rotating still keys off `piWillRetryTurn`: a statusless
+ * error is not retried in place, but it must still be replayed on the account
+ * we rotate to, or the turn stops dead (tests/no-status-replay-check.mjs).
+ */
+function retryInPlaceHelps(errorMessage: string): boolean {
+	const status = parseHttpStatus(errorMessage) ?? inferStatusFromErrorType(errorMessage);
+	return status === 400;
+}
+
 // ==========================================================================
 // Schedule evaluation helpers
 // ==========================================================================
@@ -3170,12 +3201,12 @@ class PoolManager {
 
 		// Give this account one more go before writing it off.
 		//
-		// Gated on the same predicate as the replay: when piWillRetryTurn is true,
-		// pi has ALREADY retried this request internally and surfaced the failure
-		// only after exhausting its own attempts, so a second try here adds
-		// nothing. When it is false - a bare provider string, or a 400 - pi did not
-		// try at all, and on this provider a 400 is frequently a transient refusal
-		// rather than a capacity fact (docs/adr/0001).
+		// Only on a 400, which is the one error class where the same account can
+		// answer the same request seconds later (docs/adr/0001). A 429 arrives
+		// after pi exhausted its own retries, and a statusless cap like Codex's
+		// means the account has no capacity at all - retrying either one burns
+		// requests and delays the rotation that would have worked. See
+		// retryInPlaceHelps.
 		//
 		// Deliberately before markExhausted: a blip must not reach the shared
 		// ledger, because that would evict a healthy account for every other
@@ -3187,7 +3218,7 @@ class PoolManager {
 			inPlaceDelay > 0 &&
 			inPlaceMax > 0 &&
 			lastUserPrompt &&
-			!piWillRetryTurn(errorMessage) &&
+			retryInPlaceHelps(errorMessage) &&
 			inPlaceSpent < inPlaceMax
 		) {
 			const attempt = inPlaceSpent + 1;

@@ -39,7 +39,7 @@ const originalPrompt = "implement task 3 of the page-intros plan";
 writeFileSync(join(agentDir, "multi-pass.json"), JSON.stringify({
 	subscriptions: [{ provider: "anthropic", index: 2 }],
 	pools: [
-		{ name: "anthropic", baseProvider: "anthropic", members: ["anthropic", "anthropic-2"], enabled: true },
+		{ name: "anthropic", baseProvider: "anthropic", members: ["anthropic", "anthropic-2", "anthropic-3"], enabled: true },
 		{ name: "codex", baseProvider: "openai-codex", members: ["openai-codex"], enabled: true },
 	],
 	chains: [{
@@ -55,6 +55,7 @@ writeFileSync(join(agentDir, "multi-pass.json"), JSON.stringify({
 writeFileSync(join(agentDir, "auth.json"), JSON.stringify({
 	anthropic: { type: "oauth", access: "fake-anthropic" },
 	"anthropic-2": { type: "oauth", access: "fake-anthropic-2" },
+	"anthropic-3": { type: "oauth", access: "fake-anthropic-3" },
 	"openai-codex": { type: "oauth", access: "fake-codex" },
 }, null, 2));
 
@@ -79,6 +80,7 @@ const multiSub = mod.default;
 const models = new Map([
 	["anthropic:claude-opus-5", { provider: "anthropic", id: "claude-opus-5", api: "fake" }],
 	["anthropic-2:claude-opus-5", { provider: "anthropic-2", id: "claude-opus-5", api: "fake" }],
+	["anthropic-3:claude-opus-5", { provider: "anthropic-3", id: "claude-opus-5", api: "fake" }],
 	["openai-codex:gpt-5.6-sol", { provider: "openai-codex", id: "gpt-5.6-sol", api: "fake" }],
 ]);
 const handlers = new Map();
@@ -269,19 +271,50 @@ assert.equal(injectedUserMessages.length, 4, "and replay onto the new account");
 
 await replayTurn();
 
+// ── A statusless cap must rotate on the FIRST failure ────────────────────
+//
+// `Codex error: The usage limit has been reached` is a capacity fact, not a
+// per-request refusal: nothing on that account will serve the turn until the
+// cap resets. Retrying it in place burns three requests and 6s before the
+// rotation that was always the only fix - observed 2026-09-03, three
+// "attempt N of 3" notices against the codex cap in one pane.
+//
+// The old gate was `!piWillRetryTurn`, true here because the string carries no
+// status, so this error took the 400's retry path. Only a 400 may.
+const switchesBeforeCap = modelSwitches.length;
+await emit("agent_end", codexCapEvent("anthropic-2", "claude-opus-5"));
+assert.equal(
+	modelSwitches.length,
+	switchesBeforeCap + 1,
+	"a statusless cap must rotate on the first failure, not after three in-place retries",
+);
+assert.equal(currentModel.provider, "anthropic-3", "onto the next live account");
+assert.equal(injectedUserMessages.length, 5, "exactly one replay, on the account it rotated to");
+assert.equal(
+	notifications.filter((n) => n.message.includes("retrying the same account")).length,
+	3,
+	"still only the three 400 retries - the cap must add none",
+);
+
+await replayTurn();
+
 // ── An error pi already retried itself must rotate immediately ───────────
 //
 // A 429 reaches us only after pi exhausted its own retries, so a second try
-// here would add nothing. This is why the in-place retry is gated on the same
-// predicate as the replay rather than on "is it a limit".
+// here would add nothing.
 const switchesBefore429 = modelSwitches.length;
-await emit("agent_end", rateLimitedEvent("anthropic-2", "claude-opus-5"));
+await emit("agent_end", rateLimitedEvent("anthropic-3", "claude-opus-5"));
 assert.equal(
 	modelSwitches.length,
 	switchesBefore429 + 1,
 	"a 429 must rotate on the first failure - pi has already retried it",
 );
 assert.equal(currentModel.provider, "openai-codex");
+assert.equal(
+	notifications.filter((n) => n.message.includes("retrying the same account")).length,
+	3,
+	"and the 429 must add no in-place retry either",
+);
 
 // ── The default is 3 when nothing is configured ──────────────────────────
 {
