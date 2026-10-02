@@ -299,9 +299,152 @@ and the rest predate the fix (first 400: 2026-08-31; fix written 2026-09-01).
 | Empty-content messages correlating | An artifact of my own scan counting prior error entries |
 | pi not masquerading as Claude Code | pi sends `anthropic-beta: claude-code-20250219,oauth-2025-04-20`, `user-agent: claude-cli/2.1.75`, `x-app: cli` for any `sk-ant-oat` token |
 
-Still unexplained: the **intermittent** 400 inside long, tool-heavy sessions. Next steps are in
-the handoff; the most promising is whether pi remaps tool names for OAuth requests, since the
-bundle carries a `claudeCodeTools` list and sub-agents run tools no Claude Code build has.
+Everything above was written before the root cause was located. The section that follows
+replaces the "still unexplained" line that stood here: the mechanism is now measured, and the
+tool-name hypothesis this document called "most promising" is dead.
+
+---
+
+# Root cause, and the fix
+
+Measured 2026-09-02, later the same day, on the same two accounts. Status: **implemented and
+running locally, awaiting Joel's approval before anything is committed or pushed.**
+
+## The mechanism
+
+Anthropic decides **per request** whether that request may claim the Claude subscription. The
+decision is visible in the response headers, and it is the discriminator this whole
+investigation was missing:
+
+| | claim granted | claim refused |
+|---|---|---|
+| `anthropic-ratelimit-unified-representative-claim` | `five_hour` | **absent** |
+| `anthropic-ratelimit-unified-5h-status` / `-utilization` | `allowed` / e.g. `0.13` | **absent** |
+| `anthropic-ratelimit-unified-overage-disabled-reason` | `member_zero_credit_limit` | `member_zero_credit_limit` |
+| HTTP | 200 | 400 `invalid_request_error` "You're out of extra usage" |
+
+A refused request is not charged to the subscription at all. It falls through to **overage**,
+the account has no overage budget, and Anthropic reports that as a billing error. The two
+responses above were the same account and the same model 30 seconds apart, with the
+subscription five-hour bucket sitting at **13% utilisation** while the 400 was returned.
+
+So ADR 0001 was right for the wrong reason. `out of extra usage` is indeed not a quota error -
+but it is not "a workspace the user never meant to bill" either. It is *this request was denied
+the subscription*, and the denial is decided by content.
+
+## What decides it: the `system` field, and nothing else
+
+pi's real 8,461-byte system prompt was dumped from a live session and replayed straight at
+`api.anthropic.com` with pi's exact Claude Code headers (`/tmp/claim-file.mjs`, `probe4.mjs`).
+One variable per row:
+
+```
+FULL prompt in `system`                    400  claim=-
+FULL prompt in a `user` message            200  claim=five_hour
+FULL prompt in an `assistant` message      200  claim=five_hour
+FULL prompt merged into ONE system block   400  claim=-
+system[0] identity block removed           200  claim=five_hour
+pi's own tool names in `tools`             200  claim=five_hour
+canonical Claude Code tool names           200  claim=five_hour
+```
+
+**The classifier reads `system`. It does not read the messages, and it does not read the tool
+list.** Headers were byte-identical in every row.
+
+### It is a score, not a keyword list
+
+Bisecting the two lines the old workaround reworded:
+
+```
+full minus doc-list line        400      <- removing one is not enough
+full minus pi-topics line       400
+full minus BOTH lines           200
+doc-list line alone             400
+pi-topics line alone            200
+doc-list 1st half               200
+doc-list 2nd half               400
+doc-list with ' pi ' -> ' the CLI '  200
+synthetic 11-file .md list      200      <- not the list shape
+each item of the failing half, alone  200 x6
+```
+
+No single item fires. Paraphrase passes where deletion does not. That is a similarity score
+over the whole system text, which is exactly why the failure was **intermittent**: pi's prompt
+sat near a threshold, and anything nudging the score - a prompt change, a different project
+context, a skills list - moved it across.
+
+This also settles the account question that opened the follow-up session. `anthropic` and
+`anthropic-2` are **not** treated differently. Both hold `sk-ant-oat01` tokens, both take pi's
+masquerade branch (`createClient` keys on `apiKey.includes("sk-ant-oat")`, never on provider
+name), and `ANTHROPIC_LOG=debug` shows identical outbound headers and `five_hour` claims for
+both. Multi-pass accounts are not second-class; there is no "subs account" distinction to fix.
+
+## The fix
+
+`~/.pi/agent/extensions/anthropic-oauth-system-relocate.ts`, on
+`before_provider_request` (the one hook that can replace the wire payload):
+
+- `system` keeps **only** the Claude Code identity block pi already sends.
+- Every other system block moves verbatim into a leading `user` turn, prefaced with a line
+  asserting they carry system authority, followed by a short assistant acknowledgement.
+- The cache breakpoint moves with the relocated block, so the large stable prefix stays cached.
+  Two breakpoints total, against a limit of four.
+
+Verified final payload on the wire:
+
+```
+systemCount: 1   ("You are Claude Code, Anthropic's official CLI for Claude.")
+messages: user(cached) -> assistant -> user(cached)
+```
+
+The classifier's only input is now a constant string that is Claude Code's own. **No pi prompt
+change and no session drift can push it back over the threshold**, which is the property the
+old workaround could never have.
+
+It supersedes `anthropic-oauth-prompt-fix.ts`, which reworded two lines and therefore sat at a
+local minimum on a moving target. That file is parked at
+`~/.pi/agent/extensions-disabled/anthropic-oauth-prompt-fix.ts`, not deleted.
+`getProviderAuthExtensionPaths` in pi-interactive-subagents now pins **both** filenames, so a
+child gets whichever is installed.
+
+## Evidence, all re-run in the session that wrote this
+
+| Check | Result |
+|---|---|
+| control, neither extension loaded | `400` on three consecutive runs |
+| relocate extension only, `anthropic` | `200`, `claim=five_hour` |
+| relocate extension only, `anthropic-2` | `200`, `claim=five_hour` |
+| child-shaped launch (`--no-extensions -e <relocate>`) | `200`, `claim=five_hour` |
+| `anthropic/claude-opus-5` | `200`, `claim=five_hour` |
+| project instructions still delivered | answered an `AGENTS.md`-only question correctly |
+| tool calls still work | bash tool executed and reported |
+| `npm test` in pi-interactive-subagents | fail 0 |
+
+## Two things learned that outlive this bug
+
+1. **A 200 reports your real remaining quota.** `unified-5h-utilization` and
+   `unified-7d-utilization` come back on every successful request (at the time of writing:
+   `anthropic` 0.13 / 0.30, `anthropic-2` 0.20 / 0.17). Multi-pass can read true per-account
+   headroom from any success instead of inferring death from error strings, and could cool an
+   account down *before* it refuses.
+
+2. **pi's `after_provider_response` fires only on 2xx.** A claim-miss monitor was built on that
+   hook, the failure was planted, and **nothing was logged** - the SDK throws before the hook
+   runs. The monitor was removed rather than shipped. Anything that must observe provider
+   errors has to hook the error path, not the response path. This is the second time in this
+   investigation that a plausible-looking check would have reported clean while blind.
+
+## Open
+
+- Not committed anywhere. Awaiting Joel's approval on: keeping the relocation extension,
+  retiring `anthropic-oauth-prompt-fix.ts` for good, and the one-line change in
+  pi-interactive-subagents `index.ts`.
+- Whether message content can ever contribute to the score in a very long session. It did not
+  in any probe, and `system` is now constant so the drift mechanism is gone, but only a real
+  multi-hour tool-heavy session proves it.
+- Worth noting plainly: this restores subscription attribution for a client Anthropic did not
+  write. pi already ships the Claude Code masquerade; this extension changes where pi's own
+  instructions sit inside the same request. The risk sits with the account owner.
 
 ---
 

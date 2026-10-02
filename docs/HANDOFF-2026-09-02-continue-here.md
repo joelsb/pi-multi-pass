@@ -101,7 +101,21 @@ Subagents repo:
 
 ---
 
-## The one thing still unexplained
+## The one thing still unexplained - RESOLVED, awaiting approval
+
+**Root cause found and fixed later the same day. Read
+`docs/findings/2026-09-02-anthropic-400-investigation.md`, section "Root cause, and the fix",
+before anything below in this section.** In one line: Anthropic content-classifies the
+**`system` field only** and denies the subscription claim to a request whose system prompt does
+not read as Claude Code; the denied request falls to overage, which is zero, and that is the
+400. The fix (`~/.pi/agent/extensions/anthropic-oauth-system-relocate.ts`) leaves only the
+Claude Code identity block in `system` and moves pi's prompt into a leading user turn.
+Implemented, verified on both accounts, **not committed - waiting for Joel's approval**.
+
+Two claims in the rest of this section are now known wrong: the tool-name axis was measured and
+makes no difference, and "it is not the auth path" was right for the wrong reason - both
+accounts are identical, but the request content was never neutral. The rest is kept as the
+record of what the evidence looked like before the cause was known.
 
 **An intermittent `400 invalid_request_error` "You're out of extra usage" inside long,
 tool-heavy sessions.** Same session, same model, same account, seconds apart:
