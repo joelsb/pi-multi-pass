@@ -32,9 +32,8 @@ Never go back to `npm:pi-multi-pass` (changed 2026-10-02): the old flow hand-cop
 over the npm package, and on 2026-09-21 a package update replaced it with upstream 1.5.1,
 dropping every fix below, ring traversal included.
 
-The subagents extension is different: `settings.json` loads it from the **working tree**
-(`"packages": [..., "/Users/joelsbastos/MYNE/Projects/tools/pi-interactive-subagents"]`), so a
-`git checkout` there changes the tooling of every new pi process immediately.
+Since 2026-10-02 every pi package loads from git the same way, subagents included
+(`git:github.com/joelsb/pi-interactive-subagents`): push, then `pi update --extension <source>`.
 
 ---
 
