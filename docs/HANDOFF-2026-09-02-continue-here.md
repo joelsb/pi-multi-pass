@@ -16,18 +16,21 @@ Two repos, both on `main`, both pushed to the `fork` remote:
 
 ## Read this first: the deploy step
 
-`~/.pi/agent/npm/node_modules/pi-multi-pass/extensions/multi-sub.ts` is a **file copy** of the
-published npm package, not a symlink to the checkout. A commit changes nothing that pi runs
-until it is copied across. **This silently ran stale code three times in one session.**
+pi loads multi-pass from `git:github.com/joelsb/pi-multi-pass` (in `~/.pi/agent/settings.json`
+and the shared `~/.agents/pi-packages.txt`), cloned at `~/.pi/agent/git/github.com/joelsb/pi-multi-pass`.
+A commit changes nothing pi runs until it is pushed to the fork and pulled with `pi update --extension`.
 
 ```bash
-bash scripts/deploy.sh          # copy across, with a backup
-bash scripts/deploy.sh --check  # drift report, exit 1 if they differ
+bash scripts/deploy.sh          # push HEAD to fork main, pi update --extension, verify
+bash scripts/deploy.sh --check  # drift report, exit 1 if pi runs another commit
 ```
 
 Put `--check` in front of any "it works now" claim. Extensions load **per process**, so an
-already-running pi keeps the old copy until it restarts or `/reload`s. `pi package update`
-overwrites the deployed file with upstream and drops every local fix.
+already-running pi keeps the old code until it restarts or `/reload`s.
+
+Never go back to `npm:pi-multi-pass` (changed 2026-10-02): the old flow hand-copied this file
+over the npm package, and on 2026-09-21 a package update replaced it with upstream 1.5.1,
+dropping every fix below, ring traversal included.
 
 The subagents extension is different: `settings.json` loads it from the **working tree**
 (`"packages": [..., "/Users/joelsbastos/MYNE/Projects/tools/pi-interactive-subagents"]`), so a

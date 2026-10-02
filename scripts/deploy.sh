@@ -1,50 +1,37 @@
 #!/usr/bin/env bash
 #
-# Copy this working tree's extension over the installed one.
+# Ship this repo's main to the pi that runs it.
 #
-# pi loads ~/.pi/agent/npm/node_modules/pi-multi-pass/extensions/multi-sub.ts,
-# which is a FILE COPY of the upstream npm package, not a symlink to this repo.
-# A commit here changes nothing until it is copied across. That gap bit three
-# times in one session: tests green, config correct, behaviour unchanged,
-# because the running pi was still on the old file.
+# pi loads multi-pass from `git:github.com/joelsb/pi-multi-pass` (settings.json),
+# cloned under ~/.pi/agent/git/github.com/joelsb/pi-multi-pass. A commit changes
+# nothing pi runs until it is pushed to the fork and `pi update --extension` pulls it.
 #
-#   bash scripts/deploy.sh          copy, after backing the old file up
-#   bash scripts/deploy.sh --check  report drift only, exit 1 if they differ
+# Never `npm:pi-multi-pass`: on 2026-09-21 a package update replaced the hand-copied
+# fork with upstream 1.5.1 and silently dropped every fix here, including the chain
+# ring, so failover went anthropic -> anthropic-2 -> codex and never back.
 #
-# `pi package update` (or npm) will overwrite the deployed copy with upstream
-# and silently drop every local fix. Re-run this afterwards.
+#   bash scripts/deploy.sh          push main to fork, pi update, verify
+#   bash scripts/deploy.sh --check  report drift only, exit 1 if pi runs other code
 set -euo pipefail
 
-repo_file="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/extensions/multi-sub.ts"
-installed_file="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/npm/node_modules/pi-multi-pass/extensions/multi-sub.ts"
+source="git:github.com/joelsb/pi-multi-pass"
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+installed="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/git/github.com/joelsb/pi-multi-pass"
 
-[ -f "$repo_file" ] || { echo "missing repo file: $repo_file" >&2; exit 1; }
+check() {
+  [ -d "$installed" ] || { echo "not installed: pi install $source" >&2; return 1; }
+  local want have
+  want=$(git -C "$repo" rev-parse HEAD)
+  have=$(git -C "$installed" rev-parse HEAD)
+  [ "$want" = "$have" ] && { echo "up to date: pi runs $(git -C "$repo" rev-parse --short HEAD)"; return 0; }
+  echo "DRIFT: pi runs $(git -C "$installed" rev-parse --short HEAD), repo HEAD is $(git -C "$repo" rev-parse --short HEAD)" >&2
+  return 1
+}
 
-if [ ! -f "$installed_file" ]; then
-  echo "multi-pass is not installed at $installed_file" >&2
-  echo "nothing to deploy to - install the package first" >&2
-  exit 1
-fi
+if [ "${1:-}" = "--check" ]; then check; exit; fi
 
-if cmp -s "$repo_file" "$installed_file"; then
-  echo "up to date: installed == repo"
-  exit 0
-fi
-
-if [ "${1:-}" = "--check" ]; then
-  echo "DRIFT: installed differs from repo" >&2
-  diff <(wc -l < "$installed_file") <(wc -l < "$repo_file") >/dev/null || true
-  echo "  installed: $(wc -l < "$installed_file" | tr -d ' ') lines  $installed_file" >&2
-  echo "  repo:      $(wc -l < "$repo_file" | tr -d ' ') lines  $repo_file" >&2
-  echo "  run: bash scripts/deploy.sh" >&2
-  exit 1
-fi
-
-backup="$installed_file.bak-$(date +%Y%m%d-%H%M%S)"
-cp "$installed_file" "$backup"
-cp "$repo_file" "$installed_file"
-echo "deployed  $repo_file"
-echo "       -> $installed_file"
-echo "backup    $backup"
-echo
-echo "Already-running pi sessions keep the old copy; extensions load per process."
+[ -z "$(git -C "$repo" status --porcelain)" ] || { echo "uncommitted changes, commit first" >&2; exit 1; }
+git -C "$repo" push fork HEAD:main
+(cd /tmp && pi update --extension "$source")
+check
+echo "Already-running pi sessions keep the old code until restart or /reload."
