@@ -69,6 +69,7 @@ const jiti = createJiti(import.meta.url, {
 	alias: {
 		"@earendil-works/pi-coding-agent": join(here, "stubs", "coding-agent.mjs"),
 		"@earendil-works/pi-ai/compat": join(here, "stubs", "pi-ai-failover.mjs"),
+		"@earendil-works/pi-ai/providers/all": join(here, "stubs", "pi-ai-failover.mjs"),
 		"@earendil-works/pi-ai/oauth": join(here, "stubs", "pi-ai-failover.mjs"),
 		"@earendil-works/pi-ai": join(here, "stubs", "pi-ai-failover.mjs"),
 		"@earendil-works/pi-tui": join(here, "stubs", "pi-tui.mjs"),

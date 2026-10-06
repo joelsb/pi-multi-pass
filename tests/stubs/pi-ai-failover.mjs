@@ -17,3 +17,6 @@ const models = {
 export function getModels(provider) {
 	return models[provider] ?? [];
 }
+
+export const getBuiltinModels = getModels;
+export function builtinProviders() { return []; }

@@ -30,10 +30,21 @@
  *   - github-copilot     (GitHub Copilot)
  *   - google-gemini-cli  (Google Cloud Code Assist)
  *   - google-antigravity (Antigravity)
+ *   - minimax             (MiniMax global API key)
+ *   - minimax-cn          (MiniMax China API key)
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "fs";
-import { dirname, join } from "path";
+import {
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "fs";
+import { dirname, isAbsolute, join } from "path";
+import { pathToFileURL } from "url";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -48,8 +59,12 @@ import {
 	LoginDialogComponent,
 	readStoredCredential,
 } from "@earendil-works/pi-coding-agent";
+import {
+	builtinProviders,
+	getBuiltinModels as getModels,
+} from "@earendil-works/pi-ai/providers/all";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/oauth";
-import { getModels, type Api, type Model } from "@earendil-works/pi-ai/compat";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	Container,
 	Key,
@@ -66,143 +81,136 @@ import {
 type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
 type GeminiCredentials = OAuthCredentials & { projectId?: string };
 
-/**
- * OAuth compatibility shim for pi 0.84.4.
- *
- * `@earendil-works/pi-ai/oauth` used to export the concrete flows
- * (`loginAnthropic`, `refreshAnthropicToken`, `anthropicOAuthProvider`, ...).
- * In 0.84.4 that entrypoint is TYPE-ONLY: verified at runtime inside pi, it
- * has 0 runtime exports, so every one of those imports is `undefined`. The
- * flows now live behind `Provider.auth.oauth` on the built-in provider,
- * loaded lazily by pi itself.
- *
- * So instead of importing the flows, we borrow them from the built-in
- * provider at call time. `provider.auth.oauth` is an `OAuthAuth`:
- *
- *   login(interaction: { prompt(p), notify(e), signal }): Promise<Credential>
- *   refresh(credential, signal): Promise<Credential>
- *
- * while `pi.registerProvider({ oauth })` still takes the legacy
- * callback-shaped config (`login(callbacks)`, `refreshToken`, `getApiKey`).
- * pi's own `adaptOAuth()` converts legacy -> canonical; the adapter below is
- * its inverse, so a cloned subscription runs the exact same flow as /login on
- * the base provider.
- *
- * Providers are resolved lazily because `registerSub()` runs at extension
- * load, before any ExtensionContext exists. A login can only happen after the
- * UI is up, by which point `rememberRegistry()` has captured one.
- */
-type ModelRegistryLike = ExtensionContext["modelRegistry"];
+// pi-ai >= 0.84 turned `@earendil-works/pi-ai/oauth` into a type-only entry:
+// the runtime login/refresh helpers this extension used to import are gone.
+// Resolve each built-in provider's OAuth flow from the provider catalog and
+// adapt it to the legacy callback interface `pi.registerProvider()` expects.
 
-let registryRef: ModelRegistryLike | undefined;
-
-function rememberRegistry(ctx: ExtensionContext | ExtensionCommandContext): void {
-	registryRef = ctx.modelRegistry;
+/** Legacy extension OAuth provider shape accepted by `pi.registerProvider()`. */
+interface OAuthProviderInterface {
+	id?: string;
+	name: string;
+	isSubscription?: boolean;
+	usesCallbackServer?: boolean;
+	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
+	refreshToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials>;
+	getApiKey(credentials: OAuthCredentials): string;
+	modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
 }
 
+/** New pi-ai OAuth flow surface (`OAuthAuth`), resolved from the built-in catalog. */
 interface BuiltinOAuthFlow {
-	name?: string;
+	name: string;
 	isSubscription?: boolean;
 	login(interaction: {
 		signal: AbortSignal;
-		prompt(prompt: Record<string, unknown>): Promise<string>;
-		notify(event: Record<string, unknown>): void;
+		notify(event: AuthEventLike): void;
+		prompt(prompt: AuthPromptLike): Promise<string>;
 	}): Promise<OAuthCredentials>;
-	refresh(credential: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials>;
+	refresh(credential: OAuthCredentials & { type: "oauth" }, signal: AbortSignal): Promise<OAuthCredentials>;
 }
 
-function getBuiltinOAuthFlow(baseProvider: string): BuiltinOAuthFlow {
-	const registry = registryRef;
-	if (!registry) {
-		throw new Error(
-			`Cannot start OAuth for "${baseProvider}": pi has not handed this extension a context yet.`,
-		);
-	}
-	const provider = registry.getProvider(baseProvider) as
-		| { auth?: { oauth?: BuiltinOAuthFlow } }
+interface AuthPromptLike {
+	type: "text" | "secret" | "select" | "manual_code";
+	message: string;
+	placeholder?: string;
+	options?: readonly { id: string; label: string }[];
+}
+
+interface AuthEventLike {
+	type: "info" | "auth_url" | "device_code" | "progress";
+	url?: string;
+	instructions?: string;
+	message?: string;
+	userCode?: string;
+	verificationUri?: string;
+	intervalSeconds?: number;
+	expiresInSeconds?: number;
+}
+
+const builtinOAuthFlows = new Map<string, BuiltinOAuthFlow>();
+
+function getBuiltinOAuthFlow(providerId: string): BuiltinOAuthFlow {
+	const cached = builtinOAuthFlows.get(providerId);
+	if (cached) return cached;
+	const flow = builtinProviders().find((p) => p.id === providerId)?.auth?.oauth as
+		| BuiltinOAuthFlow
 		| undefined;
-	const flow = provider?.auth?.oauth;
 	if (!flow || typeof flow.login !== "function" || typeof flow.refresh !== "function") {
-		throw new Error(
-			`Provider "${baseProvider}" exposes no built-in OAuth flow in this pi version.`,
-		);
+		throw new Error(`No built-in OAuth flow available for provider "${providerId}"`);
 	}
+	builtinOAuthFlows.set(providerId, flow);
 	return flow;
 }
 
-/**
- * Inverse of pi's `adaptOAuth()`: legacy extension callbacks -> the canonical
- * `AuthInteraction` the built-in flow expects.
- */
-function toAuthInteraction(callbacks: OAuthLoginCallbacks): {
-	signal: AbortSignal;
-	prompt(prompt: Record<string, unknown>): Promise<string>;
-	notify(event: Record<string, unknown>): void;
-} {
+/** Adapt legacy OAuthLoginCallbacks to the new pi-ai AuthInteraction surface. */
+function toAuthInteraction(callbacks: OAuthLoginCallbacks) {
 	return {
 		signal: callbacks.signal ?? new AbortController().signal,
-		async prompt(prompt: Record<string, unknown>): Promise<string> {
-			const type = prompt.type;
-			if (type === "select") {
-				const options = (prompt.options ?? []) as { id: string; label: string }[];
-				const chosen = await callbacks.onSelect({
-					message: String(prompt.message ?? ""),
-					options: options.map((option) => ({ id: option.id, label: option.label })),
-				});
-				if (chosen === undefined) throw new Error("Selection cancelled");
-				return chosen;
+		notify(event: AuthEventLike): void {
+			if (event.type === "auth_url" && event.url) {
+				callbacks.onAuth({ url: event.url, instructions: event.instructions });
+			} else if (event.type === "device_code" && event.userCode && event.verificationUri) {
+				callbacks.onDeviceCode({
+					userCode: event.userCode,
+					verificationUri: event.verificationUri,
+					intervalSeconds: event.intervalSeconds,
+					expiresInSeconds: event.expiresInSeconds,
+					});
+			} else if (event.type === "progress" && typeof event.message === "string") {
+				callbacks.onProgress?.(event.message);
 			}
-			if (type === "manual_code" && callbacks.onManualCodeInput) {
+		},
+		prompt(prompt: AuthPromptLike): Promise<string> {
+			if (prompt.type === "select") {
+				return callbacks
+					.onSelect({
+						message: prompt.message,
+						options: (prompt.options ?? []).map((o) => ({ id: o.id, label: o.label })),
+					})
+					.then((selected) => selected ?? "");
+			}
+			if (prompt.type === "manual_code" && callbacks.onManualCodeInput) {
 				return callbacks.onManualCodeInput();
 			}
-			return callbacks.onPrompt({
-				message: String(prompt.message ?? ""),
-				placeholder: prompt.placeholder as string | undefined,
-			});
-		},
-		notify(event: Record<string, unknown>): void {
-			const type = event.type;
-			if (type === "auth_url") {
-				callbacks.onAuth({
-					url: String(event.url ?? ""),
-					instructions: event.instructions as string | undefined,
-				});
-				return;
-			}
-			if (type === "device_code") {
-				callbacks.onDeviceCode({
-					userCode: String(event.userCode ?? ""),
-					verificationUri: String(event.verificationUri ?? ""),
-					intervalSeconds: event.intervalSeconds as number | undefined,
-					expiresInSeconds: event.expiresInSeconds as number | undefined,
-				});
-				return;
-			}
-			callbacks.onProgress?.(String(event.message ?? ""));
+			return callbacks.onPrompt({ message: prompt.message, placeholder: prompt.placeholder });
 		},
 	};
 }
 
-/** Legacy-shaped OAuth config for `pi.registerProvider`, backed by the built-in flow. */
-function buildOAuthFromBuiltin(
-	baseProvider: string,
+function asOAuthCredential(credentials: OAuthCredentials): OAuthCredentials & { type: "oauth" } {
+	const type = (credentials as { type?: string }).type;
+	return type === "oauth"
+		? (credentials as OAuthCredentials & { type: "oauth" })
+		: { ...credentials, type: "oauth" };
+}
+
+/** Build a legacy OAuth provider config backed by a built-in provider flow. */
+function flowBackedOAuth(
+	providerId: string,
 	name: string,
-): {
-	name: string;
-	isSubscription: boolean;
-	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
-	refreshToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials>;
-	getApiKey(credentials: OAuthCredentials): string;
-} {
+	options?: { usesCallbackServer?: boolean },
+): Omit<OAuthProviderInterface, "id"> {
+	// Mirror the built-in flow's subscription flag so extra accounts light up
+	// pi's subscription handling (e.g. the footer indicator via
+	// modelRuntime.isUsingSubscription). Guarded: providers without a flow in
+	// the installed pi-ai version must not break registration.
+	let isSubscription: boolean | undefined;
+	try {
+		isSubscription = getBuiltinOAuthFlow(providerId).isSubscription;
+	} catch {
+		// no built-in flow available; leave the flag unset
+	}
 	return {
 		name,
-		isSubscription: true,
+		isSubscription,
+		usesCallbackServer: options?.usesCallbackServer,
 		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-			return getBuiltinOAuthFlow(baseProvider).login(toAuthInteraction(callbacks));
+			return getBuiltinOAuthFlow(providerId).login(toAuthInteraction(callbacks));
 		},
 		async refreshToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials> {
-			return getBuiltinOAuthFlow(baseProvider).refresh(
-				credentials,
+			return getBuiltinOAuthFlow(providerId).refresh(
+				asOAuthCredential(credentials),
 				signal ?? new AbortController().signal,
 			);
 		},
@@ -212,30 +220,107 @@ function buildOAuthFromBuiltin(
 	};
 }
 
+// GitHub Copilot base URL derivation, ported from the pi-ai OAuth flow
+// (no longer part of the public pi-ai surface).
+
+function normalizeDomain(input: string): string | null {
+	const trimmed = input.trim();
+	if (!trimmed) return null;
+	try {
+		const url = trimmed.includes("://") ? new URL(trimmed) : new URL(`https://${trimmed}`);
+		return url.hostname;
+	} catch {
+		return null;
+	}
+}
+
+function getBaseUrlFromCopilotToken(token: string): string | null {
+	const match = token.match(/proxy-ep=([^;]+)/);
+	if (!match) return null;
+	// Convert proxy.xxx to api.xxx
+	return `https://${match[1].replace(/^proxy\./, "api.")}`;
+}
+
+function getGitHubCopilotBaseUrl(token: string | undefined, enterpriseUrl: string | undefined): string {
+	if (token) {
+		const fromToken = getBaseUrlFromCopilotToken(token);
+		if (fromToken) return fromToken;
+	}
+	const domain = enterpriseUrl ? normalizeDomain(enterpriseUrl) : null;
+	if (domain) return `https://copilot-api.${domain}`;
+	return "https://api.individual.githubcopilot.com";
+}
+
 interface ProviderTemplate {
 	displayName: string;
-	/** Built-in provider id whose OAuth flow this subscription reuses. */
-	baseProvider: string;
-	buildOAuth(index: number): ReturnType<typeof buildOAuthFromBuiltin>;
+	apiKey?: string;
+	usesCallbackServer?: boolean;
+	buildOAuth?(index: number): Omit<OAuthProviderInterface, "id">;
+	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	anthropic: {
 		displayName: "Anthropic (Claude Pro/Max)",
-		baseProvider: "anthropic",
-		buildOAuth: (index: number) => buildOAuthFromBuiltin("anthropic", `Anthropic #${index}`),
+		buildOAuth(index: number) {
+			return flowBackedOAuth("anthropic", `Anthropic #${index}`);
+		},
 	},
 
 	"openai-codex": {
 		displayName: "ChatGPT Plus/Pro (Codex)",
-		baseProvider: "openai-codex",
-		buildOAuth: (index: number) => buildOAuthFromBuiltin("openai-codex", `ChatGPT Codex #${index}`),
+		usesCallbackServer: true,
+		buildOAuth(index: number) {
+			return flowBackedOAuth("openai-codex", `ChatGPT Codex #${index}`, {
+				usesCallbackServer: true,
+			});
+		},
 	},
 
 	"github-copilot": {
 		displayName: "GitHub Copilot",
-		baseProvider: "github-copilot",
-		buildOAuth: (index: number) => buildOAuthFromBuiltin("github-copilot", `GitHub Copilot #${index}`),
+		buildOAuth(index: number) {
+			return flowBackedOAuth("github-copilot", `GitHub Copilot #${index}`);
+		},
+		buildModifyModels(providerName: string) {
+			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
+				const creds = credentials as CopilotCredentials;
+				const baseUrl = getGitHubCopilotBaseUrl(creds.access, creds.enterpriseUrl);
+				return models.map((m) =>
+					m.provider === providerName ? { ...m, baseUrl } : m,
+				);
+			};
+		},
+	},
+
+	"google-gemini-cli": {
+		displayName: "Google Cloud Code Assist",
+		usesCallbackServer: true,
+		buildOAuth(index: number) {
+			return flowBackedOAuth("google-gemini-cli", `Google Cloud Code Assist #${index}`, {
+				usesCallbackServer: true,
+			});
+		},
+	},
+
+	"google-antigravity": {
+		displayName: "Antigravity",
+		usesCallbackServer: true,
+		buildOAuth(index: number) {
+			return flowBackedOAuth("google-antigravity", `Antigravity #${index}`, {
+				usesCallbackServer: true,
+			});
+		},
+	},
+
+	minimax: {
+		displayName: "MiniMax (Global)",
+		apiKey: "$MINIMAX_API_KEY",
+	},
+
+	"minimax-cn": {
+		displayName: "MiniMax (China)",
+		apiKey: "$MINIMAX_CN_API_KEY",
 	},
 };
 
@@ -295,17 +380,20 @@ interface AuthStorageEntry {
  *                 credential this extension needs (access/refresh/expires)
  *                 comes from readStoredCredential(), which is synchronous
  *                 and reads auth.json directly.
- *   logout(p)  -> no ModelRegistry method. ModelRuntime.logout() exists but
- *                 is not reachable from ExtensionContext, so we fall back to
- *                 editing auth.json and asking the registry to refresh.
+ *   set(p, c)  -> no ModelRegistry method: write auth.json and refresh.
+ *   logout(p)  -> ModelRuntime.logout() (upstream's route, reached through the
+ *                 registry's `runtime` field) when present; otherwise edit
+ *                 auth.json and ask the registry to refresh.
  *
- * Keeping hasAuth/get synchronous avoids turning ~30 call sites async.
+ * Keeping hasAuth/get synchronous avoids turning ~30 call sites async. logout
+ * returns a Promise because the runtime route is async; the file route has
+ * finished by the time it returns.
  */
 interface AuthCompat {
 	hasAuth(provider: string): boolean;
 	get(provider: string): AuthStorageEntry | undefined;
 	set(provider: string, credential: AuthStorageEntry): void;
-	logout(provider: string): void;
+	logout(provider: string): Promise<void>;
 }
 
 function authJsonPath(): string {
@@ -323,6 +411,7 @@ function readAuthJson(): Record<string, unknown> {
 }
 
 function createAuthCompat(modelRegistry: ExtensionContext["modelRegistry"]): AuthCompat {
+	const runtime = (modelRegistry as unknown as { runtime?: { logout?(provider: string): Promise<void> } }).runtime;
 	return {
 		hasAuth(provider: string): boolean {
 			try {
@@ -340,22 +429,31 @@ function createAuthCompat(modelRegistry: ExtensionContext["modelRegistry"]): Aut
 			writeFileSync(authJsonPath(), JSON.stringify(data, null, 2), { mode: 0o600 });
 			void modelRegistry.refresh({ providers: [provider] });
 		},
-		logout(provider: string): void {
+		logout(provider: string): Promise<void> {
+			if (typeof runtime?.logout === "function") return runtime.logout(provider);
 			const data = readAuthJson();
-			if (!(provider in data)) return;
+			if (!(provider in data)) return Promise.resolve();
 			delete data[provider];
 			try {
 				writeFileSync(authJsonPath(), JSON.stringify(data, null, 2), { mode: 0o600 });
 			} catch {
-				return;
+				return Promise.resolve();
 			}
 			void modelRegistry.refresh({ providers: [provider] });
+			return Promise.resolve();
 		},
 	};
 }
 
-function ctxAuth(ctx: ExtensionContext | ExtensionCommandContext): AuthCompat {
-	rememberRegistry(ctx);
+/**
+ * Last registry any context handed us. The tier-preserving chain hop asks it
+ * whether a mapped model exists (resolveTierEquivalent), and failover code has
+ * no ctx at that depth.
+ */
+let registryRef: ExtensionContext["modelRegistry"] | undefined;
+
+function getAuthStorage(ctx: ExtensionContext | ExtensionCommandContext): AuthCompat {
+	registryRef = ctx.modelRegistry;
 	return createAuthCompat(ctx.modelRegistry);
 }
 
@@ -374,10 +472,9 @@ async function loginSubscription(ctx: ExtensionCommandContext, entry: SubEntry):
 		return false;
 	}
 
-	rememberRegistry(ctx);
 	const providerName = subProviderName(entry);
 	const displayName = subDisplayName(entry);
-	const oauth = PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index);
+	const oauth = PROVIDER_TEMPLATES[entry.provider]?.buildOAuth?.(entry.index);
 	if (!oauth) {
 		ctx.ui.notify(`No OAuth flow is available for ${displayName}.`, "error");
 		return false;
@@ -416,7 +513,7 @@ async function loginSubscription(ctx: ExtensionCommandContext, entry: SubEntry):
 					},
 					signal: dialog.signal,
 				});
-				ctxAuth(ctx).set(providerName, { ...credential, type: "oauth" });
+				getAuthStorage(ctx).set(providerName, { ...credential, type: "oauth" });
 				finish({ ok: true });
 			} catch (error) {
 				finish({
@@ -1124,12 +1221,29 @@ async function resolveGoogleQuotaAccess(
 		&& auth.access.length > 0
 		&& (typeof auth.expires !== "number" || auth.expires > Date.now() + 60_000);
 	if (hasFreshAccess) {
-		return { accessToken: auth.access as string, projectId };
+		return { accessToken: auth.access!, projectId };
 	}
 
-	// pi 0.84.4 removed the exported Google token-refresh flows and ships no
-	// google-gemini-cli / google-antigravity provider, so a stale Google token
-	// cannot be refreshed here. Fall through to the stored access token.
+	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
+		// pi-ai >= 0.84: use the built-in provider OAuth flow to refresh the
+		// access token instead of the removed refreshGoogleCloudToken helpers.
+		const flow = getBuiltinOAuthFlow(account.baseProvider);
+		const credentials = await flow.refresh(
+			asOAuthCredential({
+				access: auth.access ?? "",
+				refresh: auth.refresh,
+				expires: auth.expires ?? 0,
+				projectId,
+			}),
+			new AbortController().signal,
+		) as GeminiCredentials;
+		return {
+			accessToken: credentials.access,
+			projectId: typeof credentials.projectId === "string" && credentials.projectId.length > 0
+				? credentials.projectId
+				: projectId,
+		};
+	}
 
 	if (typeof auth.access === "string" && auth.access.length > 0) {
 		return { accessToken: auth.access, projectId };
@@ -1367,12 +1481,12 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 			providerName,
 			baseProvider: getBaseProvider(providerName) || providerName,
 			displayName,
-			auth: ctxAuth(ctx).get(providerName) as AuthStorageEntry | undefined,
+			auth: getAuthStorage(ctx).get(providerName) as AuthStorageEntry | undefined,
 		});
 	};
 
 	for (const checker of PROVIDER_QUOTA_CHECKERS) {
-		if (ctxAuth(ctx).hasAuth(checker.baseProvider)) {
+		if (getAuthStorage(ctx).hasAuth(checker.baseProvider)) {
 			pushAccount(
 				checker.baseProvider,
 				PROVIDER_TEMPLATES[checker.baseProvider]?.displayName || checker.baseProvider,
@@ -1936,18 +2050,42 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 	};
 }
 
-function saveGlobalConfig(config: MultiPassConfig): void {
-	const path = globalConfigPath();
+function saveJsonConfig(path: string, config: unknown): void {
 	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+
+	let backupPath: string | undefined;
+	if (existsSync(path)) {
+		try {
+			JSON.parse(readFileSync(path, "utf-8"));
+		} catch {
+			backupPath = `${path}.invalid-${Date.now()}-${process.pid}.bak`;
+			copyFileSync(path, backupPath);
+		}
+	}
+
+	const temporaryPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+	try {
+		writeFileSync(temporaryPath, JSON.stringify(config, null, 2), "utf-8");
+		renameSync(temporaryPath, path);
+	} catch (error) {
+		try {
+			unlinkSync(temporaryPath);
+		} catch {}
+		throw error;
+	}
+
+	if (backupPath) {
+		console.warn(`[pi-multi-pass] Backed up malformed config to ${backupPath}`);
+	}
+}
+
+function saveGlobalConfig(config: MultiPassConfig): void {
+	saveJsonConfig(globalConfigPath(), config);
 }
 
 function saveProjectConfig(cwd: string, config: ProjectConfig): void {
-	const path = projectConfigPath(cwd);
-	const dir = dirname(path);
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+	saveJsonConfig(projectConfigPath(cwd), config);
 }
 
 function getProviderDisplayName(providerName: string, subscriptions: SubEntry[]): string {
@@ -1983,7 +2121,7 @@ function getProjectScopedProviderNames(
 	}
 
 	for (const providerName of SUPPORTED_PROVIDERS) {
-		if (ctxAuth(ctx).hasAuth(providerName)) {
+		if (getAuthStorage(ctx).hasAuth(providerName)) {
 			push(providerName);
 		}
 	}
@@ -1998,7 +2136,7 @@ function findSelectableModelForProvider(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!ctxAuth(ctx).hasAuth(providerName)) {
+	if (!getAuthStorage(ctx).hasAuth(providerName)) {
 		return undefined;
 	}
 	if (preferredModelId) {
@@ -2103,6 +2241,11 @@ function subDisplayName(entry: SubEntry): string {
 	return `${entry.label} — ${providerName}`;
 }
 
+function subscriptionLoginName(entry: SubEntry): string {
+	return PROVIDER_TEMPLATES[entry.provider]?.buildOAuth?.(entry.index).name
+		?? subProviderName(entry);
+}
+
 /** Get the base provider type from a provider name, e.g. "openai-codex-2" -> "openai-codex" */
 function getBaseProvider(providerName: string): string | undefined {
 	// Direct match
@@ -2134,6 +2277,56 @@ function cloneModels(originalProvider: string, index: number) {
 	}));
 }
 
+/**
+ * Read the base provider's persisted remote-catalog overlay
+ * (~/.pi/agent/models-store.json). pi refreshes this file for builtin
+ * providers (pi.dev catalog, `pi update --models`, periodic re-checks);
+ * extension-registered providers never receive that overlay, so
+ * subscriptions mirror it from here.
+ */
+function storedOverlayModels(baseProvider: string): Model<Api>[] {
+	try {
+		const storePath = join(getAgentDir(), "models-store.json");
+		if (!existsSync(storePath)) return [];
+		const raw = JSON.parse(readFileSync(storePath, "utf8")) as Record<
+			string,
+			{ models?: unknown }
+		>;
+		const entry = raw[baseProvider];
+		if (!entry || !Array.isArray(entry.models)) return [];
+		return entry.models.filter(
+			(m): m is Model<Api> =>
+				!!m && typeof m === "object" && typeof (m as Model<Api>).id === "string",
+		);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Live model list for a subscription provider: the static builtin catalog
+ * merged with the base provider's persisted remote-catalog overlay (overlay
+ * entries win, mirroring pi's own catalog merge). Returned from
+ * `refreshModels` so catalog additions (e.g. gpt-6-astra) and metadata
+ * updates reach extra accounts on every model refresh cycle without a
+ * pi-multi-pass release.
+ */
+function liveSubscriptionModels(entry: SubEntry, name: string): Model<Api>[] {
+	const builtin = getModels(entry.provider as any) as Model<Api>[];
+	const overlay = storedOverlayModels(entry.provider);
+	const merged = [...builtin];
+	for (const model of overlay) {
+		const existing = merged.findIndex((m) => m.id === model.id);
+		if (existing >= 0) merged[existing] = model;
+		else merged.push(model);
+	}
+	return merged.map((m) => ({
+		...m,
+		provider: name,
+		name: `${m.name} (#${entry.index})`,
+	}));
+}
+
 // ==========================================================================
 // Register a single subscription as a provider
 // ==========================================================================
@@ -2143,16 +2336,21 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	if (!template) return;
 
 	const name = subProviderName(entry);
-	const oauth = template.buildOAuth(entry.index);
+	const oauth = template.buildOAuth?.(entry.index);
+	const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
 	const baseUrl = builtinModels[0]?.baseUrl || "";
 	const models = cloneModels(entry.provider, entry.index);
 
+	// Static `models` is only the startup baseline; refreshModels swaps in the
+	// live merged catalog (builtin + remote overlay) on every refresh cycle.
 	pi.registerProvider(name, {
 		baseUrl,
 		api: builtinModels[0]?.api,
-		oauth,
+		apiKey: template.apiKey,
+		oauth: oauth && modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
+		refreshModels: async () => liveSubscriptionModels(entry, name),
 	});
 }
 
@@ -2188,12 +2386,24 @@ const RATE_LIMIT_PATTERNS = [
 	/insufficient[_ ]credit/i,
 ];
 
+const TERMINAL_OAUTH_REFRESH_PATTERNS = [
+	/invalid[_\s-]?refresh[_\s-]?token/i,
+	/refresh token.*(?:invalid|expired|revoked)/i,
+	/(?:invalid|expired|revoked).*refresh token/i,
+];
+
+const providersRequiringReauthentication = new Set<string>();
+
 /**
  * True when the provider error means "this account cannot serve this turn, try
  * another one" - rate limited, over quota, or out of credit.
  */
 function isRateLimitError(errorMessage: string): boolean {
 	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
+}
+
+function isTerminalOAuthRefreshError(errorMessage: string): boolean {
+	return TERMINAL_OAUTH_REFRESH_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
 /**
@@ -2468,7 +2678,7 @@ function getScheduledMemberOrder(
 const selectorCache = new Map<string, PoolSelectorFn | null>();
 
 function resolveSelectorScriptPath(scriptPath: string): string {
-	if (scriptPath.startsWith("/")) return scriptPath;
+	if (isAbsolute(scriptPath)) return scriptPath;
 	if (scriptPath.startsWith("~/")) {
 		const home = process.env.HOME || process.env.USERPROFILE || "";
 		return join(home, scriptPath.slice(2));
@@ -2488,7 +2698,7 @@ async function loadSelectorScript(scriptPath: string): Promise<PoolSelectorFn | 
 	}
 
 	try {
-		const mod = await import(resolved);
+		const mod = await import(pathToFileURL(resolved).href);
 		const fn: PoolSelectorFn = typeof mod.default === "function"
 			? mod.default
 			: typeof mod === "function"
@@ -2613,6 +2823,24 @@ function recordExhaustedInLedger(provider: string, at: number): void {
 	}
 }
 
+interface RoutingTraceEntry {
+	timestamp: number;
+	message: string;
+}
+
+const MAX_ROUTING_TRACE_ENTRIES = 100;
+
+function summarizeTraceError(errorMessage: string): string {
+	const status = parseHttpStatus(errorMessage);
+	if (status !== undefined) return `HTTP ${status}`;
+	if (/usage.?limit/i.test(errorMessage)) return "usage limit";
+	if (/rate.?limit|too many requests/i.test(errorMessage)) return "rate limit";
+	if (/overloaded/i.test(errorMessage)) return "overloaded";
+	if (/capacity/i.test(errorMessage)) return "capacity";
+	if (/quota/i.test(errorMessage)) return "quota";
+	return "provider error";
+}
+
 class PoolManager {
 	private pools: Map<string, PoolConfig> = new Map();
 	private poolStates: Map<string, PoolState> = new Map();
@@ -2620,9 +2848,40 @@ class PoolManager {
 	private providerToPool: Map<string, string> = new Map();
 	private pi: ExtensionAPI;
 	private cascadeState: FailoverCascadeState | null = null;
+	private traceEnabled = false;
+	private routingTrace: RoutingTraceEntry[] = [];
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
+	}
+
+	startTrace(): void {
+		this.routingTrace = [];
+		this.traceEnabled = true;
+	}
+
+	stopTrace(): void {
+		this.traceEnabled = false;
+	}
+
+	clearTrace(): void {
+		this.routingTrace = [];
+	}
+
+	isTraceEnabled(): boolean {
+		return this.traceEnabled;
+	}
+
+	getRoutingTrace(): RoutingTraceEntry[] {
+		return this.routingTrace.map((entry) => ({ ...entry }));
+	}
+
+	private recordTrace(message: string): void {
+		if (!this.traceEnabled) return;
+		this.routingTrace.push({ timestamp: Date.now(), message });
+		if (this.routingTrace.length > MAX_ROUTING_TRACE_ENTRIES) {
+			this.routingTrace.splice(0, this.routingTrace.length - MAX_ROUTING_TRACE_ENTRIES);
+		}
 	}
 
 	private getOrCreatePoolState(poolName: string): PoolState {
@@ -3043,7 +3302,7 @@ class PoolManager {
 				const best = await this.getQuotaBestMember(
 					pool,
 					currentModel.provider,
-					ctxAuth(ctx),
+					getAuthStorage(ctx),
 					cascade.attemptedProviders,
 				);
 				if (best) {
@@ -3057,6 +3316,7 @@ class PoolManager {
 							`[pool:${pool.name}] quota-first: ${best} has the most remaining quota`,
 							"info",
 						);
+						this.recordTrace(`${best} ranked first by quota-first in pool ${pool.name}`);
 					}
 				}
 			} catch {
@@ -3085,6 +3345,7 @@ class PoolManager {
 					`[pool:${pool.name}] scheduled: ${first} selected by schedule priority`,
 					"info",
 				);
+				this.recordTrace(`${first} ranked first by schedule in pool ${pool.name}`);
 			}
 			return;
 		}
@@ -3110,6 +3371,7 @@ class PoolManager {
 							`[pool:${pool.name}] custom: selector chose ${best}`,
 							"info",
 						);
+						this.recordTrace(`${best} ranked first by custom selector in pool ${pool.name}`);
 					}
 				}
 			} catch {
@@ -3157,6 +3419,11 @@ class PoolManager {
 				visitedChainIndexes: new Set<number>(),
 				retriedInPlace: new Map<string, number>(),
 			};
+			if (currentModel) {
+				const pool = this.getPoolForProvider(currentModel.provider);
+				const source = pool ? `pool ${pool.name} (${pool.strategy || "round-robin"})` : "current model";
+				this.recordTrace(`turn started on ${currentModel.provider} (${currentModel.id}) via ${source}`);
+			}
 			return;
 		}
 		if (currentModel) {
@@ -3197,6 +3464,7 @@ class PoolManager {
 		const pool = this.getPoolForProvider(currentModel.provider);
 		if (!pool) return false;
 
+		this.recordTrace(`${currentModel.provider} failed with ${summarizeTraceError(errorMessage)}`);
 		const cascade = this.ensureCascadeState(lastUserPrompt, currentModel);
 
 		// Give this account one more go before writing it off.
@@ -3242,7 +3510,7 @@ class PoolManager {
 		const plan = this.buildFailoverPlan(
 			currentModel,
 			config,
-			ctxAuth(ctx),
+			getAuthStorage(ctx),
 			{
 				attemptedProviders: cascade.attemptedProviders,
 				visitedChainIndexes: cascade.visitedChainIndexes,
@@ -3265,12 +3533,14 @@ class PoolManager {
 				`[pool:${skip.poolName}] ${skip.detail}; ${continuation}`,
 				"warning",
 			);
+			this.recordTrace(skip.detail);
 		}
 
 		const nextCandidate = plan.candidates[0];
 		if (!nextCandidate) {
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
+			this.recordTrace(`failover exhausted in pool ${pool.name}`);
 			return false;
 		}
 
@@ -3280,6 +3550,7 @@ class PoolManager {
 				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); cascade exhausted; no later eligible target`,
 				"warning",
 			);
+			this.recordTrace(`${nextCandidate.provider} skipped because model ${nextCandidate.modelId} is unavailable`);
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
@@ -3291,6 +3562,7 @@ class PoolManager {
 				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,
 				"warning",
 			);
+			this.recordTrace(`${nextCandidate.provider} skipped because authentication was unavailable`);
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
@@ -3306,6 +3578,10 @@ class PoolManager {
 			"info",
 		);
 		ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
+		const route = nextCandidate.source === "chain"
+			? `chain ${nextCandidate.chainName}#${(nextCandidate.chainIndex ?? 0) + 1}`
+			: `pool ${nextCandidate.poolName} (${pool.strategy || "round-robin"})`;
+		this.recordTrace(`selected ${nextCandidate.provider} (${nextCandidate.modelId}) via ${route}`);
 
 		// Switching the model is not the same as running the turn. pi retries the
 		// failed turn on the new account only for the statuses in piWillRetryTurn;
@@ -3327,6 +3603,11 @@ class PoolManager {
 		// the failed turn is still streaming.
 		if (lastUserPrompt && !piWillRetryTurn(errorMessage)) {
 			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
+			this.recordTrace("queued follow-up because pi will not retry this error");
+		} else if (piWillRetryTurn(errorMessage)) {
+			this.recordTrace("waiting for pi to retry the turn");
+		} else {
+			this.recordTrace("turn cannot be replayed because no prompt was captured");
 		}
 
 		return true;
@@ -3360,7 +3641,11 @@ function formatSubscriptionMeta(
 ): string {
 	const name = subProviderName(entry);
 	const hasAuth = authStorage.hasAuth(name);
-	const status = hasAuth ? "[logged in]" : "[not logged in]";
+	const status = providersRequiringReauthentication.has(name)
+		? "[reauthentication required]"
+		: hasAuth
+			? "[logged in]"
+			: "[not logged in]";
 	const source = getSubscriptionSource(config, entry);
 	return `${status} (${source})`;
 }
@@ -3392,7 +3677,7 @@ function getSwitchableProviderOptions(
 	const seen = new Set<string>();
 	const push = (providerName: string, label: string, description: string) => {
 		if (allowed && !allowed.has(providerName)) return;
-		if (!ctxAuth(ctx).hasAuth(providerName)) return;
+		if (!getAuthStorage(ctx).hasAuth(providerName)) return;
 		if (seen.has(providerName)) return;
 		seen.add(providerName);
 		options.push({ providerName, label, description });
@@ -3416,7 +3701,7 @@ function resolveSwitchTargetModel(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!ctxAuth(ctx).hasAuth(providerName)) {
+	if (!getAuthStorage(ctx).hasAuth(providerName)) {
 		return undefined;
 	}
 	if (preferredModelId) {
@@ -3532,9 +3817,10 @@ async function removeSubscriptionEntry(
 	if (!confirmed) return;
 
 	const name = subProviderName(entry);
-	if (ctxAuth(ctx).hasAuth(name)) {
-		ctxAuth(ctx).logout(name);
+	if (getAuthStorage(ctx).hasAuth(name)) {
+		await getAuthStorage(ctx).logout(name);
 	}
+	providersRequiringReauthentication.delete(name);
 	pi.unregisterProvider(name);
 
 	for (const pool of config.pools) {
@@ -3573,7 +3859,7 @@ async function showSubscriptionActions(
 			items: [
 				{
 					value: subProviderName(entry),
-					label: formatSubscriptionListLine(entry, config, ctxAuth(ctx)),
+					label: formatSubscriptionListLine(entry, config, getAuthStorage(ctx)),
 				},
 			],
 			confirmHint: "back",
@@ -3583,9 +3869,21 @@ async function showSubscriptionActions(
 	}
 
 	const name = subProviderName(entry);
-	const hasAuth = ctxAuth(ctx).hasAuth(name);
+	const authStorage = getAuthStorage(ctx);
+	const hasAuth = authStorage.hasAuth(name);
+	const auth = authStorage.get(name);
+	const needsReauthentication = providersRequiringReauthentication.has(name);
 	const actionItems: SelectItem[] = [
 		{ value: "rename", label: "rename", description: "Change friendly label" },
+		...(hasAuth && auth?.type === "oauth"
+			? [{
+				value: "reauthenticate",
+				label: "re-authenticate",
+				description: needsReauthentication
+					? "Replace the rejected OAuth credential"
+					: "Replace the saved OAuth credential",
+			}]
+			: []),
 		hasAuth
 			? { value: "logout", label: "logout", description: "Log out this subscription" }
 			: { value: "login", label: "login", description: "Start the OAuth login for this subscription" },
@@ -3608,9 +3906,22 @@ async function showSubscriptionActions(
 		await loginSubscription(ctx, entry);
 		return;
 	}
+	if (action === "reauthenticate") {
+		const confirmed = await ctx.ui.confirm(
+			`Re-authenticate ${subDisplayName(entry)}`,
+			"The saved OAuth credential will be removed before starting a new login. Continue?",
+		);
+		if (!confirmed) return;
+		await authStorage.logout(name);
+		providersRequiringReauthentication.delete(name);
+		// Fork: start the OAuth flow right away (loginSubscription) instead of
+		// sending the user to /login.
+		await loginSubscription(ctx, entry);
+		return;
+	}
 	if (action === "logout") {
-		ctxAuth(ctx).logout(name);
-		ctx.modelRegistry.refresh();
+		await authStorage.logout(name);
+		providersRequiringReauthentication.delete(name);
 		ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 		return;
 	}
@@ -3642,7 +3953,7 @@ async function handleSubsList(
 			items: all.map((entry) => ({
 				value: subProviderName(entry),
 				label: subDisplayName(entry),
-				description: formatSubscriptionMeta(entry, config, ctxAuth(ctx)),
+				description: formatSubscriptionMeta(entry, config, getAuthStorage(ctx)),
 			})),
 			initialValue: preferredProviderName,
 			confirmHint: "open",
@@ -3730,7 +4041,7 @@ async function handleSubsRemove(
 		items: config.subscriptions.map((entry) => ({
 			value: subProviderName(entry),
 			label: subDisplayName(entry),
-			description: ctxAuth(ctx).hasAuth(subProviderName(entry))
+			description: getAuthStorage(ctx).hasAuth(subProviderName(entry))
 				? "logged in"
 				: "not logged in",
 		})),
@@ -3751,16 +4062,17 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
+	const authStorage = getAuthStorage(ctx);
+	const loginCandidates = all.filter((entry) => {
+		const name = subProviderName(entry);
+		return !authStorage.hasAuth(name) || authStorage.get(name)?.type === "oauth";
+	});
 
-	const notLoggedIn = all.filter(
-		(entry) => !ctxAuth(ctx).hasAuth(subProviderName(entry)),
-	);
-
-	if (notLoggedIn.length === 0) {
+	if (loginCandidates.length === 0) {
 		ctx.ui.notify(
 			all.length === 0
 				? "No subscriptions configured. Use /subs add first."
-				: "All subscriptions are already logged in.",
+				: "All subscriptions use API keys and are already configured.",
 			"info",
 		);
 		return;
@@ -3768,20 +4080,40 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 
 	const selectedProviderName = await showWrappedSelect(ctx, {
 		title: "Login to subscription",
-		subtitle: "Select a subscription to start its OAuth login.",
+		subtitle: "Logged-in OAuth subscriptions can be re-authenticated.",
 		initialValue: ctx.model?.provider,
-		items: notLoggedIn.map((entry) => ({
-			value: subProviderName(entry),
-			label: subDisplayName(entry),
-			description: "not logged in",
-		})),
+		items: loginCandidates.map((entry) => {
+			const name = subProviderName(entry);
+			const hasAuth = authStorage.hasAuth(name);
+			return {
+				value: name,
+				label: subDisplayName(entry),
+				description: providersRequiringReauthentication.has(name)
+					? "reauthentication required"
+					: hasAuth
+						? "logged in; re-authenticate"
+						: "not logged in",
+			};
+		}),
 		confirmHint: "open",
 		cancelHint: "back",
 	});
 	if (!selectedProviderName) return;
 
-	const entry = notLoggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
+	const entry = loginCandidates.find(
+		(candidate) => subProviderName(candidate) === selectedProviderName,
+	);
 	if (!entry) return;
+
+	if (authStorage.hasAuth(selectedProviderName)) {
+		const confirmed = await ctx.ui.confirm(
+			`Re-authenticate ${subDisplayName(entry)}`,
+			"The saved OAuth credential will be removed before starting a new login. Continue?",
+		);
+		if (!confirmed) return;
+		await authStorage.logout(selectedProviderName);
+		providersRequiringReauthentication.delete(selectedProviderName);
+	}
 
 	await loginSubscription(ctx, entry);
 }
@@ -3792,7 +4124,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const loggedIn = all.filter((entry) =>
-		ctxAuth(ctx).hasAuth(subProviderName(entry)),
+		getAuthStorage(ctx).hasAuth(subProviderName(entry)),
 	);
 
 	if (loggedIn.length === 0) {
@@ -3817,8 +4149,8 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = loggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	ctxAuth(ctx).logout(subProviderName(entry));
-	ctx.modelRegistry.refresh();
+	await getAuthStorage(ctx).logout(subProviderName(entry));
+	providersRequiringReauthentication.delete(subProviderName(entry));
 	ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 }
 
@@ -3835,14 +4167,16 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const lines: string[] = [];
 	for (const entry of all) {
 		const name = subProviderName(entry);
-		const cred = ctxAuth(ctx).get(name);
-		const hasAuth = ctxAuth(ctx).hasAuth(name);
+		const cred = getAuthStorage(ctx).get(name);
+		const hasAuth = getAuthStorage(ctx).hasAuth(name);
 
 		let status: string;
-		if (!hasAuth) {
+		if (providersRequiringReauthentication.has(name)) {
+			status = "reauthentication required (use /subs login)";
+		} else if (!hasAuth) {
 			status = "not logged in";
 		} else if (cred?.type === "oauth") {
-			const expiresIn = (cred.expires ?? 0) - Date.now();
+			const expiresIn = typeof cred.expires === "number" ? cred.expires - Date.now() : 0;
 			if (expiresIn > 0) {
 				const mins = Math.round(expiresIn / 60000);
 				status = `logged in (expires ${mins}m)`;
@@ -4163,14 +4497,14 @@ async function editPoolMembers(
 		const removableItems: SelectItem[] = selectedMembers.map((member) => ({
 			value: `remove:${member}`,
 			label: `remove ${member}`,
-			description: ctxAuth(ctx).hasAuth(member) ? "logged in" : "not logged in",
+			description: getAuthStorage(ctx).hasAuth(member) ? "logged in" : "not logged in",
 		}));
 		const addableItems: SelectItem[] = availableProviders
 			.filter((providerName) => !selectedMembers.includes(providerName))
 			.map((providerName) => ({
 				value: `add:${providerName}`,
 				label: `add ${providerName}`,
-				description: ctxAuth(ctx).hasAuth(providerName)
+				description: getAuthStorage(ctx).hasAuth(providerName)
 					? "logged in"
 					: "not logged in",
 			}));
@@ -4258,7 +4592,7 @@ async function promptForPoolDefinition(
 
 	const allProviders = getAllProvidersForBase(baseProvider, allSubs);
 	const authedProviders = allProviders.filter((p) =>
-		ctxAuth(ctx).hasAuth(p),
+		getAuthStorage(ctx).hasAuth(p),
 	);
 
 	if (authedProviders.length === 0) {
@@ -4278,7 +4612,7 @@ async function promptForPoolDefinition(
 		const optionsList = [
 			`--- Selected (${members.length}): ${members.join(", ") || "none"} ---`,
 			...remaining.map((p) => {
-				const authed = ctxAuth(ctx).hasAuth(p);
+				const authed = getAuthStorage(ctx).hasAuth(p);
 				return `${p} ${authed ? "[logged in]" : "[not logged in]"}`;
 			}),
 			"[Done - create pool]",
@@ -4498,7 +4832,7 @@ async function inspectPoolConfig(
 	await showWrappedSelect(ctx, {
 		title: `Pool Status: ${pool.name}`,
 		subtitle: "Press Enter or Escape to go back to the pools list.",
-		items: formatPoolStatusLines(pool, ctxAuth(ctx), poolManager)
+		items: formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager)
 			.map((line, index) => ({ value: `${index}:${line}`, label: line })),
 		confirmHint: "back",
 		cancelHint: "back",
@@ -4734,7 +5068,7 @@ async function handlePoolList(
 			items: pools.map((pool) => ({
 				value: pool.name,
 				label: pool.name,
-				description: formatPoolListDescription(pool, ctxAuth(ctx), poolManager),
+				description: formatPoolListDescription(pool, getAuthStorage(ctx), poolManager),
 			})),
 			initialValue: preferredPoolName,
 			confirmHint: "open",
@@ -4912,7 +5246,7 @@ async function handlePoolStatus(
 	const lines: string[] = [];
 	for (const pool of config.pools) {
 		lines.push(
-			...formatPoolStatusLines(pool, ctxAuth(ctx), poolManager),
+			...formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager),
 		);
 	}
 
@@ -5370,7 +5704,7 @@ async function handlePoolChainList(
 	await ctx.ui.select(
 		"Chains",
 		config.chains.map((chain) =>
-			formatChainListLine(chain, config, ctxAuth(ctx), poolManager),
+			formatChainListLine(chain, config, getAuthStorage(ctx), poolManager),
 		),
 	);
 }
@@ -5450,7 +5784,7 @@ async function handlePoolChainStatus(
 
 	await ctx.ui.select(
 		`Chain Status: ${chain.name}`,
-		formatChainStatusLines(chain, config, ctxAuth(ctx), poolManager),
+		formatChainStatusLines(chain, config, getAuthStorage(ctx), poolManager),
 	);
 }
 
@@ -5538,7 +5872,7 @@ async function handlePoolProject(
 		const allSubs = normalizeEntries(mergeConfigs(globalConf, envEntries));
 		const allProviderNames = [
 			...SUPPORTED_PROVIDERS.filter((p) =>
-				ctxAuth(ctx).hasAuth(p),
+				getAuthStorage(ctx).hasAuth(p),
 			),
 			...allSubs.map((s) => subProviderName(s)),
 		];
@@ -5559,7 +5893,7 @@ async function handlePoolProject(
 			const options = [
 				`--- Allowed (${allowed.length}): ${allowed.join(", ") || "all (no restriction)"} ---`,
 				...remaining.map((p) => {
-					const authed = ctxAuth(ctx).hasAuth(p);
+					const authed = getAuthStorage(ctx).hasAuth(p);
 					const current = currentAllowed.includes(p) ? " [currently allowed]" : "";
 					return `${p} ${authed ? "[logged in]" : "[not logged in]"}${current}`;
 				}),
@@ -5690,12 +6024,81 @@ async function handlePoolProject(
 		lines.push("");
 		lines.push(`Effective subs (${effective.subscriptions.length}):`);
 		for (const sub of effective.subscriptions) {
-			const authed = ctxAuth(ctx).hasAuth(subProviderName(sub));
+			const authed = getAuthStorage(ctx).hasAuth(subProviderName(sub));
 			lines.push(`  ${subDisplayName(sub)} -- ${authed ? "logged in" : "not logged in"}`);
 		}
 
 		await ctx.ui.select("Effective Config", lines);
 		return;
+	}
+}
+
+async function handlePoolTrace(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	action?: string,
+): Promise<void> {
+	let selectedAction = action;
+	if (!selectedAction) {
+		selectedAction = await showWrappedSelect(ctx, {
+			title: "Routing Trace",
+			subtitle: poolManager.isTraceEnabled() ? "Recording is active." : "Recording is off until explicitly started.",
+			items: [
+				{ value: "start", label: "start", description: "Clear old entries and begin recording" },
+				{ value: "show", label: "show", description: "Inspect recorded routing decisions" },
+				{ value: "stop", label: "stop", description: "Stop recording and retain entries" },
+				{ value: "clear", label: "clear", description: "Delete recorded entries" },
+				{ value: "status", label: "status", description: "Show recording state and entry count" },
+			],
+			confirmHint: "run",
+			cancelHint: "back",
+		});
+	}
+	if (!selectedAction) return;
+
+	switch (selectedAction) {
+		case "start":
+			poolManager.startTrace();
+			ctx.ui.notify("Routing trace started; previous entries cleared", "info");
+			return;
+		case "stop":
+			poolManager.stopTrace();
+			ctx.ui.notify("Routing trace stopped; recorded entries retained", "info");
+			return;
+		case "clear":
+			poolManager.clearTrace();
+			ctx.ui.notify("Routing trace cleared", "info");
+			return;
+		case "status": {
+			const state = poolManager.isTraceEnabled() ? "recording" : "stopped";
+			ctx.ui.notify(`Routing trace: ${state}, ${poolManager.getRoutingTrace().length} entries`, "info");
+			return;
+		}
+		case "show": {
+			const entries = poolManager.getRoutingTrace();
+			if (entries.length === 0) {
+				ctx.ui.notify(
+					poolManager.isTraceEnabled()
+						? "Routing trace is recording but has no entries yet"
+						: "Routing trace is empty; run /pool trace start first",
+					"info",
+				);
+				return;
+			}
+			await showWrappedSelect(ctx, {
+				title: "Routing Trace",
+				subtitle: `${entries.length} most recent decisions (maximum ${MAX_ROUTING_TRACE_ENTRIES}).`,
+				items: entries.map((entry, index) => ({
+					value: String(index),
+					label: `${new Date(entry.timestamp).toLocaleTimeString()}  ${entry.message}`,
+				})),
+				confirmHint: "close",
+				cancelHint: "close",
+			});
+			return;
+		}
+		default:
+			return handlePoolTrace(ctx, poolManager);
 	}
 }
 
@@ -5710,6 +6113,7 @@ async function handlePoolMenu(
 		"toggle   -- Enable/disable a pool",
 		"remove   -- Remove a pool",
 		"status   -- Detailed pool status with member health",
+		"trace    -- Opt-in routing decision trace",
 		"project  -- Project-level pool config (.pi/multi-pass.json)",
 	];
 
@@ -5730,6 +6134,8 @@ async function handlePoolMenu(
 			return handlePoolRemove(ctx, poolManager);
 		case "status":
 			return handlePoolStatus(ctx, poolManager);
+		case "trace":
+			return handlePoolTrace(ctx, poolManager);
 		case "project":
 			return handlePoolProject(ctx, poolManager);
 	}
@@ -5961,7 +6367,7 @@ async function handlePresetActivate(
 
 	for (const entry of preset.entries) {
 		if (!entry.enabled) continue;
-		if (!ctxAuth(ctx).hasAuth(entry.provider)) continue;
+		if (!getAuthStorage(ctx).hasAuth(entry.provider)) continue;
 		const model = ctx.modelRegistry.find(entry.provider, entry.model);
 		if (!model) continue;
 
@@ -6140,8 +6546,8 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// On session start, reload pools with project-level config
 	pi.on("session_start", async (_event, ctx) => {
-		// Capture a ModelRegistry for the OAuth shim before any /login can run.
-		rememberRegistry(ctx);
+		// Capture the ModelRegistry for resolveTierEquivalent before any failover runs.
+		registryRef = ctx.modelRegistry;
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
@@ -6203,10 +6609,27 @@ export default function multiSub(pi: ExtensionAPI) {
 		if (!lastMsg || lastMsg.role !== "assistant") return;
 
 		const assistantMsg = lastMsg as any;
-		if (assistantMsg.stopReason !== "error") return;
+		const providerName = ctx.model?.provider;
+		if (assistantMsg.stopReason !== "error") {
+			if (providerName) providersRequiringReauthentication.delete(providerName);
+			return;
+		}
 		if (!assistantMsg.errorMessage) return;
 
 		const effective = loadEffectiveConfig(ctx.cwd);
+		if (
+			providerName &&
+			isTerminalOAuthRefreshError(assistantMsg.errorMessage) &&
+			effective.subscriptions.some((entry) => subProviderName(entry) === providerName) &&
+			getAuthStorage(ctx).get(providerName)?.type === "oauth"
+		) {
+			providersRequiringReauthentication.add(providerName);
+			ctx.ui.notify(
+				`${getProviderDisplayName(providerName, effective.subscriptions)} needs reauthentication. Run /subs login to replace the rejected credential.`,
+				"warning",
+			);
+		}
+
 		const rotated = await poolManager.handleError(
 			assistantMsg.errorMessage,
 			ctx.model,
@@ -6228,7 +6651,7 @@ export default function multiSub(pi: ExtensionAPI) {
 			if (pool) {
 				const available = poolManager.getAvailableMembers(
 					pool,
-					ctxAuth(ctx),
+					getAuthStorage(ctx),
 				);
 				if (available.length === 0) {
 					ctx.ui.notify(
@@ -6289,7 +6712,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("pool", {
 		description: "Manage subscription rotation pools",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["create", "list", "chain", "toggle", "remove", "status", "project"];
+			const subcommands = ["create", "list", "chain", "toggle", "remove", "status", "trace", "project"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -6303,6 +6726,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				.filter(Boolean);
 			const subcommand = parts[0] || "";
 			const chainSubcommand = parts[1] || "";
+			const traceSubcommand = parts[1] || "";
 			switch (subcommand) {
 				case "create":
 				case "new":
@@ -6341,6 +6765,8 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "status":
 				case "info":
 					return handlePoolStatus(ctx, poolManager);
+				case "trace":
+					return handlePoolTrace(ctx, poolManager, traceSubcommand || undefined);
 				case "project":
 					return handlePoolProject(ctx, poolManager);
 				default:
@@ -6405,7 +6831,7 @@ export default function multiSub(pi: ExtensionAPI) {
 /** Internal surface exposed for tests/auth-compat-check.mjs only. */
 export const __testHooks = {
 	createAuthCompat,
-	buildOAuthFromBuiltin,
+	flowBackedOAuth,
 	toAuthInteraction,
 	parseScheduleWindowInput,
 	initialAllowedSubs,

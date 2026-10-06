@@ -43,10 +43,17 @@ for (const gone of [
 		`extension still imports ${gone} from pi-ai/oauth, which is type-only in pi 0.84.4`,
 	);
 }
+// Value imports from the pi-ai root are gone in pi 0.84.4 (type-only imports
+// are fine). getModels comes from the provider catalog, as upstream does.
 assert.equal(
-	/from "@earendil-works\/pi-ai";/.test(code),
+	/^import \{[^}]*\} from "@earendil-works\/pi-ai";/m.test(code),
 	false,
-	'getModels must come from "@earendil-works/pi-ai/compat" in pi 0.84.4',
+	'no value imports from "@earendil-works/pi-ai" in pi 0.84.4',
+);
+assert.match(
+	code,
+	/getBuiltinModels as getModels[\s\S]*?from "@earendil-works\/pi-ai\/providers\/all"/,
+	'getModels must come from "@earendil-works/pi-ai/providers/all"',
 );
 assert.equal(
 	/Use \/login and select/.test(code),
@@ -84,6 +91,7 @@ const jiti = createJiti(import.meta.url, {
 	alias: {
 		"@earendil-works/pi-coding-agent": join(here, "stubs", "coding-agent.mjs"),
 		"@earendil-works/pi-ai/compat": join(here, "stubs", "pi-ai.mjs"),
+		"@earendil-works/pi-ai/providers/all": join(here, "stubs", "pi-ai.mjs"),
 		"@earendil-works/pi-ai/oauth": join(here, "stubs", "pi-ai.mjs"),
 		"@earendil-works/pi-ai": join(here, "stubs", "pi-ai.mjs"),
 		"@earendil-works/pi-tui": join(here, "stubs", "pi-tui.mjs"),
@@ -134,6 +142,18 @@ assert.deepEqual(refreshCalls.at(-1), { providers: ["anthropic-2"] }, "logout mu
 const before = readFileSync(authPath, "utf-8");
 auth.logout("not-there");
 assert.equal(readFileSync(authPath, "utf-8"), before, "logout of an unknown provider must be a no-op");
+
+// When the registry exposes ModelRuntime (pi 0.84+), logout goes through it,
+// as upstream does, and auth.json is left to the runtime.
+const runtimeLogouts = [];
+const withRuntime = internals.createAuthCompat({
+	...registry,
+	runtime: { logout: async (p) => void runtimeLogouts.push(p) },
+});
+const beforeRuntime = readFileSync(authPath, "utf-8");
+await withRuntime.logout("anthropic");
+assert.deepEqual(runtimeLogouts, ["anthropic"], "logout must use runtime.logout when present");
+assert.equal(readFileSync(authPath, "utf-8"), beforeRuntime, "runtime route must not edit auth.json itself");
 
 assert.ok(existsSync(authPath));
 console.log("auth-compat-check: all assertions passed");
