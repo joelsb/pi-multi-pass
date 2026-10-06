@@ -30,7 +30,7 @@ check() {
 
 if [ "${1:-}" = "--check" ]; then check; exit; fi
 
-[ -z "$(git -C "$repo" status --porcelain)" ] || { echo "uncommitted changes, commit first" >&2; exit 1; }
+[ -z "$(git -C "$repo" status --porcelain --untracked-files=no)" ] || { echo "uncommitted changes, commit first" >&2; exit 1; }
 git -C "$repo" push fork HEAD:main
 (cd /tmp && pi update --extension "$source")
 check
