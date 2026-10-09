@@ -205,7 +205,7 @@ Each pool has a `strategy` that controls how the next member is chosen on failov
 | Strategy | Behavior |
 |---|---|
 | `round-robin` | Rotate sequentially through members (default) |
-| `quota-first` | Query built-in quota checkers and prefer the member with the most remaining quota |
+| `quota-first` | Query built-in quota checkers (Anthropic, Codex) and prefer the member whose weekly quota is worth most per hour before it resets, at session start and on failover |
 | `scheduled` | Use per-member time windows and priority roles |
 | `custom` | Delegate to a user-provided JS selector script |
 
@@ -215,9 +215,11 @@ All strategies fall back to round-robin when their specific data is unavailable.
 
 #### `quota-first`
 
-You have 3 Codex accounts in a pool. Account A has 80% of its 5-hour window left, account B has 20%, account C has 60%. On failover, `quota-first` picks account A first instead of just the next one in rotation order.
+You have 2 Claude accounts in a pool. Account A has 43% of its week left, resetting in 4 days. Account B has 53% left, resetting in 20 hours. Whatever B does not spend in those 20 hours is lost, so `quota-first` starts the session on B, and on failover picks the member with the highest weekly % left per hour until reset, instead of the next one in rotation order.
 
-Uses the same built-in quota checkers as `/subs limits` (currently Codex and Google providers).
+A member with under 10% of its 5-hour window or under 5% of its week left is skipped. When no member qualifies, the one with the most remaining quota wins on failover and the session stays where it is at start. The pick at session start costs one usage call per pool member (5 second timeout, any failure keeps the current model). It is made once: switching accounts mid-session loses the prompt cache. The chain order (pool to pool) never changes, only the order inside a pool.
+
+Uses the same built-in quota checkers as `/subs limits` (currently Anthropic and Codex). Anthropic usage needs a Claude subscription (OAuth) login, not an API key.
 
 ```json
 {
@@ -455,7 +457,7 @@ Google quota is not a single flat subscription bucket, so the details view shows
 
 `/subs limits` is an on-demand snapshot. It helps you see which account looks healthiest right now. Automatic switching still happens when the active provider returns a rate-limit-style runtime error and that provider belongs to an enabled pool or chain.
 
-When a pool uses the `quota-first` strategy, the same quota checkers are used automatically during failover to pick the healthiest member instead of just round-robin.
+When a pool uses the `quota-first` strategy, the same quota checkers are used automatically at session start and during failover to pick the member whose weekly quota expires soonest instead of just round-robin.
 
 When a project defines `.pi/multi-pass.json` with `allowedSubs`, `/subs limits` only shows accounts allowed in that project.
 

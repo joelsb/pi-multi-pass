@@ -331,6 +331,7 @@ const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
 // ==========================================================================
 
 const DEFAULT_CODEX_USAGE_BASE_URL = "https://chatgpt.com/backend-api";
+const ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const GOOGLE_GEMINI_QUOTA_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 const GOOGLE_ANTIGRAVITY_QUOTA_ENDPOINTS = [
 	"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
@@ -550,6 +551,12 @@ interface QuotaCheckResult {
 	summary: string;
 	details: string[];
 	score: number;
+	/** Percent left in the 5-hour window, when the provider reports one. */
+	fiveHourLeft?: number;
+	/** Percent left in the weekly window, when the provider reports one. */
+	weeklyLeft?: number;
+	/** When the weekly window resets, epoch seconds. */
+	weeklyResetAt?: number;
 }
 
 interface ProviderQuotaChecker {
@@ -742,8 +749,17 @@ function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
 	kind: QuotaStatusKind;
 	score: number;
 } {
-	const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
-	const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
+	return classifyQuotaBottleneck(
+		getCodexWindowRemaining(snapshot.fiveHour),
+		getCodexWindowRemaining(snapshot.weekly),
+	);
+}
+
+/** Bottleneck of the remaining 5-hour and weekly percentages. */
+function classifyQuotaBottleneck(fiveHourLeft: number | undefined, weeklyLeft: number | undefined): {
+	kind: QuotaStatusKind;
+	score: number;
+} {
 	const values = [fiveHourLeft, weeklyLeft].filter((value): value is number => value !== undefined);
 	if (values.length === 0) {
 		return { kind: "error", score: 0 };
@@ -753,6 +769,31 @@ function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
 	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
 	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
 	return { kind: "ready", score: bottleneck };
+}
+
+/**
+ * quota-first ranking: the member whose weekly quota is worth most per hour
+ * before it resets, because what it does not spend by then is lost. A member
+ * under 10% of its 5-hour window or 5% of its week is skipped, and so is one
+ * that does not report both windows and the weekly reset. Returns undefined
+ * when no member qualifies. Ties keep the order given.
+ */
+function pickExpiringFirst(results: QuotaCheckResult[], nowMs: number): string | undefined {
+	let best: string | undefined;
+	let bestRate = -Infinity;
+	for (const result of results) {
+		if (result.kind === "error" || result.kind === "missing-auth") continue;
+		const { fiveHourLeft, weeklyLeft, weeklyResetAt } = result;
+		if (fiveHourLeft === undefined || weeklyLeft === undefined || weeklyResetAt === undefined) continue;
+		if (fiveHourLeft < 10 || weeklyLeft < 5) continue;
+		const hoursLeft = Math.max((weeklyResetAt * 1000 - nowMs) / 3_600_000, 1);
+		const rate = weeklyLeft / hoursLeft;
+		if (rate > bestRate) {
+			bestRate = rate;
+			best = result.account.providerName;
+		}
+	}
+	return best;
 }
 
 function formatQuotaKind(kind: QuotaStatusKind): string {
@@ -1590,6 +1631,9 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 				summary,
 				details,
 				score: classification.score,
+				fiveHourLeft,
+				weeklyLeft,
+				weeklyResetAt: snapshot.weekly?.resetAt,
 			};
 		} catch (error: unknown) {
 			if (signal?.aborted || isAbortError(error)) throw error;
@@ -1606,6 +1650,109 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 				],
 				score: 0,
 			};
+		}
+	},
+};
+
+/** Percent left in one window of the Anthropic usage response (utilization is percent used). */
+function getAnthropicWindowLeft(window: unknown): { left: number; resetAt?: number } | undefined {
+	if (!window || typeof window !== "object") return undefined;
+	const { utilization, resets_at } = window as { utilization?: unknown; resets_at?: unknown };
+	if (typeof utilization !== "number" || !Number.isFinite(utilization)) return undefined;
+	return {
+		left: Math.max(0, Math.min(100, 100 - utilization)),
+		resetAt: typeof resets_at === "string" ? parseIsoTimestampSeconds(resets_at) : undefined,
+	};
+}
+
+const anthropicQuotaChecker: ProviderQuotaChecker = {
+	baseProvider: "anthropic",
+	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
+		const failure = (kind: "error" | "missing-auth", message: string, extra: string[] = []): QuotaCheckResult => ({
+			account,
+			kind,
+			summary: message,
+			details: [
+				`account: ${account.displayName}`,
+				`provider: ${account.providerName}`,
+				`status: ${formatQuotaKind(kind)}`,
+				...extra,
+			],
+			score: 0,
+		});
+		const auth = account.auth;
+		if (!auth) {
+			return failure("missing-auth", "not logged in", [
+				"login: use /subs login or /login to authenticate this account",
+			]);
+		}
+		if (auth.type !== "oauth") {
+			return failure("error", "usage needs a Claude subscription login", [
+				"details: this account uses an API key, which has no usage windows",
+			]);
+		}
+
+		// auth.json holds an access token that dies within the hour. pi's registry
+		// refreshes it; fall back to the stored one when it cannot.
+		let token: string | undefined;
+		try {
+			token = await registryRef?.getApiKeyForProvider?.(account.providerName);
+		} catch {
+			// fall back to the stored token
+		}
+		if (!token && typeof auth.access === "string") token = auth.access;
+		if (!token) {
+			return failure("missing-auth", "not logged in", [
+				"login: use /subs login or /login to authenticate this account",
+			]);
+		}
+
+		try {
+			const response = await fetch(ANTHROPIC_USAGE_URL, {
+				method: "GET",
+				headers: new Headers({
+					Authorization: `Bearer ${token}`,
+					"anthropic-beta": "oauth-2025-04-20",
+					Accept: "application/json",
+					"User-Agent": "pi-multi-pass",
+				}),
+				signal,
+			});
+			if (!response.ok) {
+				const error = await readResponseError(response);
+				return failure("error", error, [`details: ${error}`]);
+			}
+
+			const body = (await response.json()) as { five_hour?: unknown; seven_day?: unknown };
+			const fiveHour = getAnthropicWindowLeft(body.five_hour);
+			const weekly = getAnthropicWindowLeft(body.seven_day);
+			const classification = classifyQuotaBottleneck(fiveHour?.left, weekly?.left);
+			const summary = [
+				`5h ${formatRemainingPercent(fiveHour?.left)} (${formatResetShort(fiveHour?.resetAt)})`,
+				`7d ${formatRemainingPercent(weekly?.left)} (${formatResetShort(weekly?.resetAt)})`,
+				formatQuotaKind(classification.kind),
+			].join(" | ");
+			return {
+				account,
+				kind: classification.kind,
+				summary,
+				details: [
+					`account: ${account.displayName}`,
+					`provider: ${account.providerName}`,
+					`status: ${formatQuotaKind(classification.kind)}`,
+					`5-hour window: ${formatRemainingPercent(fiveHour?.left)} left, resets ${formatResetLong(fiveHour?.resetAt)}`,
+					`7-day window: ${formatRemainingPercent(weekly?.left)} left, resets ${formatResetLong(weekly?.resetAt)}`,
+					`endpoint: ${ANTHROPIC_USAGE_URL}`,
+				],
+				score: classification.score,
+				fiveHourLeft: fiveHour?.left,
+				weeklyLeft: weekly?.left,
+				weeklyResetAt: weekly?.resetAt,
+			};
+		} catch (error: unknown) {
+			if (signal?.aborted || isAbortError(error)) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			return failure("error", message, [`details: ${message}`]);
 		}
 	},
 };
@@ -1627,7 +1774,7 @@ const googleAntigravityQuotaChecker: ProviderQuotaChecker = {
 // Google checkers are retained for reference but not registered: pi 0.84.4
 // exposes no google-gemini-cli / google-antigravity provider, so no such
 // subscription can exist to check.
-const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [codexQuotaChecker];
+const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [codexQuotaChecker, anthropicQuotaChecker];
 void googleGeminiCliQuotaChecker;
 void googleAntigravityQuotaChecker;
 
@@ -1689,8 +1836,10 @@ interface SubEntry {
 
 /** Pool member selection strategy.
  *  - "round-robin": rotate sequentially through members (default).
- *  - "quota-first": query built-in quota checkers and prefer the member
- *    with the most remaining quota. Falls back to round-robin when no
+ *  - "quota-first": query built-in quota checkers (Anthropic, Codex) and
+ *    prefer the member whose weekly quota is worth most per hour before it
+ *    resets, at session start and on failover. Falls back to the most
+ *    remaining quota, then to round-robin, when no member qualifies or no
  *    quota data is available.
  *  - "scheduled": use per-member time-window schedules to pick the best
  *    member. Preferred members in their active window go first (shortest
@@ -2876,7 +3025,7 @@ class PoolManager {
 		return this.routingTrace.map((entry) => ({ ...entry }));
 	}
 
-	private recordTrace(message: string): void {
+	recordTrace(message: string): void {
 		if (!this.traceEnabled) return;
 		this.routingTrace.push({ timestamp: Date.now(), message });
 		if (this.routingTrace.length > MAX_ROUTING_TRACE_ENTRIES) {
@@ -3237,20 +3386,26 @@ class PoolManager {
 	}
 
 	/**
-	 * Pick the best member using built-in quota checkers.
-	 * Returns the provider name with the highest remaining quota,
-	 * or undefined if no quota data is available (caller should
-	 * fall back to round-robin).
+	 * Pick the best member using built-in quota checkers: the one whose
+	 * weekly quota is worth most per hour before it resets (see
+	 * pickExpiringFirst). When no member qualifies, the one with the most
+	 * remaining quota. Returns undefined if no quota data is available
+	 * (caller should fall back to round-robin).
+	 *
+	 * `includeCurrent` ranks the current provider too, for session start. There
+	 * a pool where nobody qualifies yields undefined, so the session stays put.
 	 */
 	async getQuotaBestMember(
 		pool: PoolConfig,
 		currentProvider: string,
 		authStorage: AuthCompat,
 		excludeProviders?: Set<string>,
+		options?: { includeCurrent?: boolean; signal?: AbortSignal },
 	): Promise<string | undefined> {
 		const available = this.getAvailableMembers(pool, authStorage);
 		const eligible = available.filter(
-			(member) => member !== currentProvider && !(excludeProviders?.has(member)),
+			(member) =>
+				(options?.includeCurrent || member !== currentProvider) && !(excludeProviders?.has(member)),
 		);
 		if (eligible.length === 0) return undefined;
 		// If only one candidate, skip the network calls.
@@ -3264,8 +3419,10 @@ class PoolManager {
 		}));
 
 		try {
-			const results = await runQuotaChecks(accounts);
+			const results = await runQuotaChecks(accounts, options?.signal);
 			if (results.length === 0) return undefined;
+			const expiring = pickExpiringFirst(results, Date.now());
+			if (expiring || options?.includeCurrent) return expiring;
 			// runQuotaChecks returns sorted best-first.
 			const best = results[0];
 			// Only use quota selection when the best result has real data.
@@ -4644,7 +4801,7 @@ async function promptForPoolDefinition(
 	// Ask for selection strategy
 	const strategyItems = [
 		"round-robin -- Rotate members sequentially (default)",
-		"quota-first -- Prefer the member with the most remaining quota",
+		"quota-first -- Prefer the member whose weekly quota expires soonest",
 		"scheduled -- Use per-member time windows and priority roles",
 		"custom -- Delegate to a JS selector script",
 	];
@@ -4867,7 +5024,7 @@ async function changePoolStrategy(
 		{
 			value: "quota-first",
 			label: "quota-first",
-			description: "Prefer the member with the most remaining quota",
+			description: "Prefer the member whose weekly quota expires soonest",
 		},
 		{
 			value: "scheduled",
@@ -6544,6 +6701,38 @@ export default function multiSub(pi: ExtensionAPI) {
 		return false;
 	};
 
+	// quota-first at session start: begin on the member whose weekly quota
+	// expires soonest. Any failure leaves the session where it is.
+	const startOnExpiringMember = async (ctx: ExtensionContext, effective: EffectiveConfig): Promise<void> => {
+		try {
+			const model = ctx.model;
+			if (!model) return;
+			const pool = poolManager.getPoolForProvider(model.provider);
+			if (!pool || pool.strategy !== "quota-first") return;
+			const best = await poolManager.getQuotaBestMember(
+				pool,
+				model.provider,
+				getAuthStorage(ctx),
+				undefined,
+				{ includeCurrent: true, signal: AbortSignal.timeout(5000) },
+			);
+			if (!best || best === model.provider) return;
+			if (effective.allowedProviderNames && !effective.allowedProviderNames.includes(best)) return;
+			const target = findSelectableModelForProvider(ctx, best, model.id);
+			if (!target) return;
+			projectRestrictionSwitchInFlight = true;
+			try {
+				if (!(await pi.setModel(target))) return;
+			} finally {
+				projectRestrictionSwitchInFlight = false;
+			}
+			ctx.ui.notify(`multi-pass: ${best} first, its weekly quota expires soonest`, "info");
+			poolManager.recordTrace(`${best} ranked first at session start by quota-first in pool ${pool.name}`);
+		} catch {
+			// Quota data unavailable: stay on the current model.
+		}
+	};
+
 	// On session start, reload pools with project-level config
 	pi.on("session_start", async (_event, ctx) => {
 		// Capture the ModelRegistry for resolveTierEquivalent before any failover runs.
@@ -6574,6 +6763,7 @@ export default function multiSub(pi: ExtensionAPI) {
 		}
 
 		await enforceProjectRestriction(ctx, "session");
+		await startOnExpiringMember(ctx, effective);
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
