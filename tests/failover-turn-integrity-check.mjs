@@ -30,7 +30,7 @@ writeFileSync(join(agentDir, "multi-pass.json"), JSON.stringify({
 		enabled: true,
 		entries: [
 			{ pool: "anthropic", model: "claude-opus-5", enabled: true },
-			{ pool: "codex", model: "gpt-5.6-sol", enabled: true },
+			{ pool: "codex", model: "gpt-6.2-astra", enabled: true },
 		],
 	}],
 	presets: [],
@@ -61,7 +61,7 @@ const multiSub = mod.default;
 const models = new Map([
 	["anthropic:claude-opus-5", { provider: "anthropic", id: "claude-opus-5", api: "fake" }],
 	["anthropic-2:claude-opus-5", { provider: "anthropic-2", id: "claude-opus-5", api: "fake" }],
-	["openai-codex:gpt-5.6-sol", { provider: "openai-codex", id: "gpt-5.6-sol", api: "fake" }],
+	["openai-codex:gpt-6.2-astra", { provider: "openai-codex", id: "gpt-6.2-astra", api: "fake" }],
 ]);
 const handlers = new Map();
 const injectedUserMessages = [];
@@ -91,6 +91,7 @@ multiSub(pi);
 const notifications = [];
 const statuses = [];
 const modelRegistry = {
+	getAll() { return [...models.values()]; },
 	find(provider, modelId) {
 		return models.get(`${provider}:${modelId}`);
 	},
@@ -127,7 +128,7 @@ async function emit(type, event) {
 	}
 }
 
-function overloadedEvent(provider) {
+function rateLimitEvent(provider) {
 	return {
 		type: "agent_end",
 		messages: [{
@@ -135,7 +136,7 @@ function overloadedEvent(provider) {
 			provider,
 			model: "claude-opus-5",
 			stopReason: "error",
-			errorMessage: '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+			errorMessage: '429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limit reached"}}',
 			content: [],
 		}],
 	};
@@ -156,15 +157,15 @@ await emit("before_agent_start", {
 
 // pi 0.84.4 emits agent_end for each failed low-level run, then automatically
 // retries that same turn with agent.continue(). These fake events model two
-// overloaded providers before the third provider takes over.
-await emit("agent_end", overloadedEvent("anthropic"));
+// rate-limited accounts before the runtime-only Codex model takes over.
+await emit("agent_end", rateLimitEvent("anthropic"));
 assert.equal(currentModel.provider, "anthropic-2");
-await emit("agent_end", overloadedEvent("anthropic-2"));
-assert.equal(currentModel.provider, "openai-codex");
+await emit("agent_end", rateLimitEvent("anthropic-2"));
+assert.equal(currentModel.provider, "openai-codex", notifications.at(-1)?.message);
 
 assert.deepEqual(modelSwitches, [
 	"anthropic-2:claude-opus-5",
-	"openai-codex:gpt-5.6-sol",
+	"openai-codex:gpt-6.2-astra",
 ]);
 assert.deepEqual(
 	injectedUserMessages,
@@ -175,6 +176,7 @@ assert.equal(
 	notifications.filter((entry) => entry.level === "info" && entry.message.includes("Rate limited")).length,
 	2,
 );
-assert.equal(statuses.at(-1), "chain:all#2 | active openai-codex (gpt-5.6-sol)");
+assert.equal(statuses.at(-1), "chain:all#2 | active openai-codex (gpt-6.2-astra)");
+console.log(`After two Anthropic 429s: ${currentModel.provider}/${currentModel.id}`);
 
 console.log("failover turn integrity checks passed");

@@ -4924,6 +4924,10 @@ async function createAndPersistPool(
 }
 
 function getSelectableModelsForPool(pool: PoolConfig): string[] {
+	const liveModels = registryRef?.getAll?.();
+	if (liveModels) {
+		return [...new Set(liveModels.filter((model) => model.provider === pool.baseProvider || pool.members.includes(model.provider)).map((model) => model.id))];
+	}
 	return (getModels(pool.baseProvider as any) as Model<Api>[]).map((model) => model.id);
 }
 
