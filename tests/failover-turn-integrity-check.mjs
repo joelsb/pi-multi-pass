@@ -30,6 +30,7 @@ writeFileSync(join(agentDir, "multi-pass.json"), JSON.stringify({
 		enabled: true,
 		entries: [
 			{ pool: "anthropic", model: "claude-opus-5", enabled: true },
+			{ pool: "codex", model: "gpt-5.6-sol", enabled: true }, // builtin, absent from runtime
 			{ pool: "codex", model: "gpt-6.2-astra", enabled: true },
 		],
 	}],
@@ -176,7 +177,8 @@ assert.equal(
 	notifications.filter((entry) => entry.level === "info" && entry.message.includes("Rate limited")).length,
 	2,
 );
-assert.equal(statuses.at(-1), "chain:all#2 | active openai-codex (gpt-6.2-astra)");
+assert.ok(notifications.some(({ message }) => message.includes("invalid model: gpt-5.6-sol unavailable for codex")));
+assert.equal(statuses.at(-1), "chain:all#3 | active openai-codex (gpt-6.2-astra)");
 console.log(`After two Anthropic 429s: ${currentModel.provider}/${currentModel.id}`);
 
 console.log("failover turn integrity checks passed");
