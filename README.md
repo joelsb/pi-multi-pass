@@ -196,7 +196,7 @@ cd ~/side-project
 2. Multi-pass detects the error, marks `openai-codex` as exhausted
 3. Switches to `openai-codex-2` (same model ID, different account)
 4. Retries your last prompt automatically
-5. After a 5-minute cooldown, `openai-codex` becomes available again
+5. After a 5-minute cooldown, `openai-codex` becomes available again. Set `"cooldownMs": 0` on a pool to retry a refused member on the next failure instead, paying one request for a fresh answer; one turn still never tries a member twice
 
 ### Pool selection strategy
 

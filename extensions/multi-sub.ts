@@ -1935,6 +1935,9 @@ interface PoolConfig {
 	 *  Only used when strategy is "custom". Resolved relative to the
 	 *  global config directory (~/.pi/agent/). */
 	selectorScript?: string;
+	/** How long a refused member is skipped, in ms. Defaults to 5 minutes.
+	 *  0 retries it on the next failure, paying one request for a fresh answer. */
+	cooldownMs?: number;
 }
 
 interface ChainEntryConfig {
@@ -2924,6 +2927,7 @@ interface PoolState {
 // provider will happily repeat.
 
 const EXHAUSTED_LEDGER_CACHE_MS = 1_000;
+const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
 /** Entries older than this are pruned on write; the cooldown is much shorter. */
 const EXHAUSTED_LEDGER_MAX_AGE_MS = 60 * 60 * 1000;
 
@@ -3039,7 +3043,7 @@ class PoolManager {
 			state = {
 				currentIndex: 0,
 				exhausted: new Map(),
-				cooldownMs: 5 * 60 * 1000, // 5 min default cooldown
+				cooldownMs: DEFAULT_COOLDOWN_MS,
 			};
 			this.poolStates.set(poolName, state);
 		}
@@ -3057,6 +3061,7 @@ class PoolManager {
 			this.pools.set(pool.name, pool);
 
 			const state = this.getOrCreatePoolState(pool.name);
+			state.cooldownMs = typeof pool.cooldownMs === "number" && pool.cooldownMs >= 0 ? pool.cooldownMs : DEFAULT_COOLDOWN_MS;
 			state.currentIndex = pool.members.length > 0 ? state.currentIndex % pool.members.length : 0;
 			for (const member of Array.from(state.exhausted.keys())) {
 				if (!pool.members.includes(member)) {
