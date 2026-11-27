@@ -3544,16 +3544,8 @@ class PoolManager {
 	}
 
 	private ensureCascadeState(prompt: string | null, currentModel: Model<Api>): FailoverCascadeState {
-		if (!prompt) {
-			const fallbackState: FailoverCascadeState = {
-				prompt: "",
-				attemptedProviders: new Set([currentModel.provider]),
-				visitedChainIndexes: new Set<number>(),
-				retriedInPlace: new Map<string, number>(),
-			};
-			this.cascadeState = fallbackState;
-			return fallbackState;
-		}
+		// A continuation without user text still owns a single retry cascade.
+		prompt ??= "";
 
 		if (!this.cascadeState || this.cascadeState.prompt !== prompt) {
 			this.cascadeState = {

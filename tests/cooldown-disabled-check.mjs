@@ -175,4 +175,12 @@ assert.equal(
 	"with cooldownMs 0 the ledger must not skip the account",
 );
 
+// An extension-triggered turn has no user text to replay. Pi still retries 429s.
+const resumed = await spawnInstance("resumed");
+await resumed.emit("before_agent_start", { type: "before_agent_start", messageType: "custom", message: { role: "custom", customType: "subagent_result", content: "continue" } });
+await resumed.fail("anthropic");
+assert.equal(resumed.current().provider, "anthropic-2");
+await resumed.fail("anthropic-2");
+assert.equal(resumed.current().provider, "openai-codex", "promptless retry must advance past both refused accounts");
+await resumed.emit("agent_end", { messages: [{ role: "assistant", provider: "openai-codex", stopReason: "stop", content: [] }] });
 console.log("cooldown-disabled-check: ok");
